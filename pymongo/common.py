@@ -15,6 +15,7 @@
 
 """Functions and classes common to multiple pymongo modules."""
 import warnings
+import tornado.ioloop
 from pymongo import read_preferences
 
 from pymongo.read_preferences import ReadPreference
@@ -140,6 +141,9 @@ def validate_tag_sets(dummy, value):
 
     return value
 
+def validate_io_loop(dummy, value):
+    return value is None or isinstance(value, tornado.ioloop.IOLoop)
+
 
 # jounal is an alias for j,
 # wtimeoutms is an alias for wtimeout
@@ -163,6 +167,8 @@ VALIDATORS = {
     'secondary_acceptable_latency_ms': validate_positive_float,
     'auto_start_request': validate_boolean,
     'use_greenlets': validate_boolean,
+    'use_greenlet_async': validate_boolean,
+    'io_loop': validate_io_loop
 }
 
 

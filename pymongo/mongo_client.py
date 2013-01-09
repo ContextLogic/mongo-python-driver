@@ -235,22 +235,34 @@ class MongoClient(common.BaseObject):
                                      "2.6 you must install the ssl package "
                                      "from PyPI.")
 
-        if options.get('use_greenlets', False):
+        if options.pop('use_greenlet_async', False):
+            if not pool.have_greenlet:
+                raise ConfigurationError(
+                    "The greenlet module is not available. "
+                    "Install the greenlet package from PyPI."
+                )
+            from pymongo.green import GreenletPool
+            self.pool_class = GreenletPool
+            pool_kwargs = {'io_loop': kwargs.pop('io_loop', None)}
+        elif options.get('use_greenlets', False):
             if not pool.have_greenlet:
                 raise ConfigurationError(
                     "The greenlet module is not available. "
                     "Install the greenlet package from PyPI."
                 )
             self.pool_class = pool.GreenletPool
+            pool_kwargs = {}
         else:
             self.pool_class = pool.Pool
+            pool_kwargs = {}
 
         self.__pool = self.pool_class(
             None,
             self.__max_pool_size,
             self.__net_timeout,
             self.__conn_timeout,
-            self.__use_ssl
+            self.__use_ssl,
+            **pool_kwargs
         )
 
         self.__document_class = document_class
