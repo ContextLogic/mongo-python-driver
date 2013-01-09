@@ -16,6 +16,7 @@
 """Functions and classes common to multiple pymongo modules."""
 import sys
 import warnings
+import tornado.ioloop
 from pymongo import read_preferences
 
 from pymongo.auth import MECHANISMS
@@ -224,6 +225,9 @@ def validate_tag_sets(dummy, value):
 
     return value
 
+def validate_io_loop(dummy, value):
+    return value is None or isinstance(value, tornado.ioloop.IOLoop)
+
 
 def validate_auth_mechanism(option, value):
     """Validate the authMechanism URI option.
@@ -290,6 +294,8 @@ VALIDATORS = {
     'authsource': validate_basestring,
     'gssapiservicename': validate_basestring,
     'uuidrepresentation': validate_uuid_representation,
+    'use_greenlet_async': validate_boolean,
+    'io_loop': validate_io_loop
 }
 
 

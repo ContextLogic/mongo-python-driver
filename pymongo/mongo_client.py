@@ -327,24 +327,35 @@ class MongoClient(common.BaseObject):
                                      "2.6 you must install the ssl package "
                                      "from PyPI.")
 
-        self.__use_greenlets = options.get('use_greenlets', False)
-        self.__pool_class = pool_class
-
-        self.__connecting = False
-        if self.__use_greenlets:
-            # Greenlets don't need to lock around access to the Member;
-            # they're only interrupted when they do I/O.
-            self.__connecting_lock = thread_util.DummyLock()
+        if options.pop('use_greenlet_async', False):
+            if not pool.have_greenlet:
+                raise ConfigurationError(
+                    "The greenlet module is not available. "
+                    "Install the greenlet package from PyPI."
+                )
+            from pymongo.green import GreenletPool
+            self.pool_class = GreenletPool
+            pool_kwargs = {'io_loop': kwargs.pop('io_loop', None)}
+        elif options.get('use_greenlets', False):
+            if not pool.have_greenlet:
+                raise ConfigurationError(
+                    "The greenlet module is not available. "
+                    "Install the greenlet package from PyPI."
+                )
+            self.pool_class = pool.GreenletPool
+            pool_kwargs = {}
         else:
-            self.__connecting_lock = threading.Lock()
+            self.pool_class = pool.Pool
+            pool_kwargs = {}
 
-        if event_class:
-            self.__event_class = event_class
-        else:
-            # Prevent a cycle; this lambda shouldn't refer to self.
-            g = self.__use_greenlets
-            event_class = lambda: thread_util.create_event(g)
-            self.__event_class = event_class
+        self.__pool = self.pool_class(
+            None,
+            self.__max_pool_size,
+            self.__net_timeout,
+            self.__conn_timeout,
+            self.__use_ssl,
+            **pool_kwargs
+        )
 
         self.__future_member = None
         self.__document_class = document_class
