@@ -1,6 +1,7 @@
 import functools
 import socket
 import warnings
+import time
 
 # So that 'setup.py doc' can import this module without Tornado or greenlet
 requirements_satisfied = True
@@ -96,9 +97,9 @@ class GreenletSocket(object):
         self.use_ssl = use_ssl
         self.io_loop = io_loop
         if self.use_ssl:
-           self.stream = iostream.SSLIOStream(sock, io_loop=io_loop)
+           raise Exception("SSL isn't supported")
         else:
-           self.stream = iostream.IOStream(sock, io_loop=io_loop)
+           self.stream = iostream.IOStream(sock, io_loop=io_loop, priority=0)
 
     def setsockopt(self, *args, **kwargs):
         self.stream.socket.setsockopt(*args, **kwargs)
@@ -113,23 +114,27 @@ class GreenletSocket(object):
         if timeout:
             raise NotImplementedError
 
-    @green_sock_method
     def connect(self, pair):
-        # do the connect on the underlying socket... come back to the current
-        # greenlet when it's done
-        return self.stream.connect(pair, greenlet.getcurrent().switch)
+        # do the connect on the underlying socket synchronously...
+        self.stream.connect(pair)
 
-    @green_sock_method
     def sendall(self, data):
-        # do the send on the underlying socket... come back to the current
-        # greenlet when it's done
-        return self.stream.write(data, greenlet.getcurrent().switch)
+        # do the send on the underlying socket synchronously...
+        self.stream.write(data)
+
+    def recv(self, num_bytes):
+        # if we have enough bytes in our local buffer, don't yield
+        if self.stream.can_read_sync(num_bytes):
+            return self.stream._consume(num_bytes)
+        # else yield while we wait on Mongo to send us more
+        else:
+            return self.recv_async(num_bytes)
 
     @green_sock_method
-    def recv(self, num_bytes):
+    def recv_async(self, num_bytes):
         # do the recv on the underlying socket... come back to the current
         # greenlet when it's done
-        self.stream.read_bytes(num_bytes, greenlet.getcurrent().switch)
+        return self.stream.read_bytes(num_bytes, greenlet.getcurrent().switch)
 
     def close(self):
         # since we're explicitly handling closing here, don't raise an exception
@@ -239,45 +244,7 @@ class GreenletClient(object):
 
         assert not greenlet.getcurrent().parent, "must be run on root greenlet"
 
-        def _do_connect():
-            # make a private IOLoop for just the connect
-            io_loop = ioloop.IOLoop()
+        cls.client = pymongo.mongo_client.MongoClient(*args, **kwargs)
+        cls.client.pool_class = GreenletPool
 
-            try:
-                def inner_connect(io_loop, *args, **kwargs):
-                    # asynchronously create a MongoClient using our IOLoop
-                    kwargs['io_loop'] = io_loop
-                    kwargs['use_greenlet_async'] = True
-                    kwargs['use_greenlets'] = False
-                    cls.client = pymongo.mongo_client.MongoClient(*args, **kwargs)
-
-                    # add another callback to the IOLoop to stop it (executed
-                    # after client connect finishes)
-                    io_loop.add_callback(io_loop.stop)
-
-                # do the connect inside a child greenlet, jumping back here
-                # after the items are queued on the IOLoop (but it isn't yet
-                # started)
-                client_gr = greenlet.greenlet(inner_connect)
-                client_gr.switch(io_loop, *args, **kwargs)
-
-                # start the IOLoop on the main greenlet
-                io_loop.start()
-            finally:
-                io_loop.close()
-
-                # make the connection pool use the global IOLoop instead of the
-                # private one
-                cls.client.pool_class = functools.partial(GreenletPool,
-                                          io_loop=ioloop.IOLoop.instance())
-
-                # replace the IOLoop in the pool created in MongoClient and
-                # reset it
-                pool = cls.client._MongoClient__pool
-                pool.io_loop = ioloop.IOLoop.instance()
-                pool.reset()
-
-        # do the connection
-        conn_gr = greenlet.greenlet(_do_connect)
-        conn_gr.switch()
         return cls.client
