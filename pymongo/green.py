@@ -244,7 +244,45 @@ class GreenletClient(object):
 
         assert not greenlet.getcurrent().parent, "must be run on root greenlet"
 
-        cls.client = pymongo.mongo_client.MongoClient(*args, **kwargs)
-        cls.client.pool_class = GreenletPool
+        def _do_connect():
+            # make a private IOLoop for just the connect
+            io_loop = ioloop.IOLoop()
 
+            try:
+                def inner_connect(io_loop, *args, **kwargs):
+                    # asynchronously create a MongoClient using our IOLoop
+                    kwargs['io_loop'] = io_loop
+                    kwargs['use_greenlet_async'] = True
+                    kwargs['use_greenlets'] = False
+                    cls.client = pymongo.mongo_client.MongoClient(*args, **kwargs)
+
+                    # add another callback to the IOLoop to stop it (executed
+                    # after client connect finishes)
+                    io_loop.add_callback(io_loop.stop)
+
+                # do the connect inside a child greenlet, jumping back here
+                # after the items are queued on the IOLoop (but it isn't yet
+                # started)
+                client_gr = greenlet.greenlet(inner_connect)
+                client_gr.switch(io_loop, *args, **kwargs)
+
+                # start the IOLoop on the main greenlet
+                io_loop.start()
+            finally:
+                io_loop.close()
+
+                # make the connection pool use the global IOLoop instead of the
+                # private one
+                cls.client.pool_class = functools.partial(GreenletPool,
+                                          io_loop=ioloop.IOLoop.instance())
+
+                # replace the IOLoop in the pool created in MongoClient and
+                # reset it
+                pool = cls.client._MongoClient__pool
+                pool.io_loop = ioloop.IOLoop.instance()
+                pool.reset()
+
+        # do the connection
+        conn_gr = greenlet.greenlet(_do_connect)
+        conn_gr.switch()
         return cls.client
