@@ -1,7 +1,6 @@
 import functools
 import socket
 import warnings
-import time
 
 # So that 'setup.py doc' can import this module without Tornado or greenlet
 requirements_satisfied = True
@@ -25,6 +24,10 @@ import pymongo.mongo_client
 import pymongo.mongo_replica_set_client
 import pymongo.pool
 import pymongo.son_manipulator
+
+class MongoIOStream(iostream.IOStream):
+    def can_read_sync(self, num_bytes):
+        return self._read_buffer_size >= num_bytes
 
 
 def green_sock_method(method):
@@ -99,7 +102,7 @@ class GreenletSocket(object):
         if self.use_ssl:
            raise Exception("SSL isn't supported")
         else:
-           self.stream = iostream.IOStream(sock, io_loop=io_loop, priority=0)
+           self.stream = MongoIOStream(sock, io_loop=io_loop)
 
     def setsockopt(self, *args, **kwargs):
         self.stream.socket.setsockopt(*args, **kwargs)
