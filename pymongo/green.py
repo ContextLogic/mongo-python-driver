@@ -117,13 +117,20 @@ class GreenletSocket(object):
         if timeout:
             raise NotImplementedError
 
+    @green_sock_method
     def connect(self, pair):
-        # do the connect on the underlying socket synchronously...
-        self.stream.connect(pair)
+        # do the connect on the underlying socket asynchronously...
+        self.stream.connect(pair, greenlet.getcurrent().switch)
 
     def sendall(self, data):
         # do the send on the underlying socket synchronously...
-        self.stream.write(data)
+        try:
+            self.stream.write(data)
+        except IOError as e:
+            raise socket.error(str(e))
+
+        if self.stream.closed():
+            raise socket.error("connection closed")
 
     def recv(self, num_bytes):
         # if we have enough bytes in our local buffer, don't yield
