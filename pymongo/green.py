@@ -172,7 +172,7 @@ class GreenletSocket(object):
         return self.stream.socket.fileno()
 
 
-class GreenletPool(pymongo.pool.GreenletPool):
+class GreenletPool(pymongo.pool.Pool):
     """A simple connection pool of GreenletSockets.
 
     Note this inherits from GreenletPool so that when PyMongo internally calls
@@ -184,14 +184,14 @@ class GreenletPool(pymongo.pool.GreenletPool):
     def __init__(self, *args, **kwargs):
         io_loop = kwargs.pop('io_loop', None)
         self.io_loop = io_loop if io_loop else ioloop.IOLoop.instance()
-        pymongo.pool.GreenletPool.__init__(self, *args, **kwargs)
+        pymongo.pool.Pool.__init__(self, *args, **kwargs)
 
-    def create_connection(self, pair):
+    def create_connection(self):
         """Copy of BasePool.connect()
         """
         assert greenlet.getcurrent().parent, "Should be on child greenlet"
 
-        host, port = pair or self.pair
+        host, port = self.pair
 
         # Don't try IPv6 if we don't support it. Also skip it if host
         # is 'localhost' (::1 is fine). Avoids slow connect issues
@@ -214,7 +214,7 @@ class GreenletPool(pymongo.pool.GreenletPool):
 
                 # GreenletSocket will pause the current greenlet and resume it
                 # when connection has completed
-                green_sock.connect(pair or self.pair)
+                green_sock.connect(sa)
                 return green_sock
             except socket.error, e:
                 err = e
@@ -229,16 +229,6 @@ class GreenletPool(pymongo.pool.GreenletPool):
             # support IPv6.
             raise socket.error('getaddrinfo failed')
 
-    def connect(self, pair):
-        """Copy of BasePool.connect(), avoiding call to ssl.wrap_socket
-
-           NOTE [adam Jan/9/12]: not positive why avoiding ssl.wrap_socket is
-                needed, but since we don't use SSL, I'm just accepting it
-        """
-        green_sock = self.create_connection(pair)
-        green_sock.settimeout(self.net_timeout)
-        resp = pymongo.pool.SocketInfo(green_sock, self.pool_id)
-        return resp
 
 class GreenletClient(object):
     client = None
@@ -258,17 +248,22 @@ class GreenletClient(object):
             # make a private IOLoop for just the connect
             io_loop = ioloop.IOLoop()
 
+            def _try_stop():
+                if cls.client:
+                    io_loop.stop()
+
             try:
                 def inner_connect(io_loop, *args, **kwargs):
+                    # add another callback to the IOLoop to stop it (executed
+                    # after client connect finishes)
+                    ioloop.PeriodicCallback(_try_stop, 100, io_loop=io_loop).start()
+
                     # asynchronously create a MongoClient using our IOLoop
                     kwargs['io_loop'] = io_loop
                     kwargs['use_greenlet_async'] = True
                     kwargs['use_greenlets'] = False
+                    kwargs['_pool_class'] = GreenletPool
                     cls.client = pymongo.mongo_client.MongoClient(*args, **kwargs)
-
-                    # add another callback to the IOLoop to stop it (executed
-                    # after client connect finishes)
-                    io_loop.add_callback(io_loop.stop)
 
                 # do the connect inside a child greenlet, jumping back here
                 # after the items are queued on the IOLoop (but it isn't yet
@@ -283,12 +278,11 @@ class GreenletClient(object):
 
                 # make the connection pool use the global IOLoop instead of the
                 # private one
-                cls.client.pool_class = functools.partial(GreenletPool,
-                                          io_loop=ioloop.IOLoop.instance())
+                cls.client.io_loop = ioloop.IOLoop.instance()
 
                 # replace the IOLoop in the pool created in MongoClient and
                 # reset it
-                pool = cls.client._MongoClient__pool
+                pool = cls.client._MongoClient__member.pool
                 pool.io_loop = ioloop.IOLoop.instance()
                 pool.reset()
 
