@@ -1,6 +1,7 @@
 import functools
 import socket
 import warnings
+import time
 
 # So that 'setup.py doc' can import this module without Tornado or greenlet
 requirements_satisfied = True
@@ -175,17 +176,19 @@ class GreenletSocket(object):
 
 class GreenletPool(pymongo.pool.Pool):
     """A simple connection pool of GreenletSockets.
-
-    Note this inherits from GreenletPool so that when PyMongo internally calls
-    start_request, e.g. in Database.authenticate() or
-    MongoClient.copy_database(), this pool assigns a socket to the current
-    greenlet for the duration of the method. Request semantics are not exposed
-    to Motor's users.
     """
     def __init__(self, *args, **kwargs):
         io_loop = kwargs.pop('io_loop', None)
         self.io_loop = io_loop if io_loop else ioloop.IOLoop.instance()
         pymongo.pool.Pool.__init__(self, *args, **kwargs)
+
+        if self.max_size is not None and self.wait_queue_multiple:
+            raise ValueError("GreenletPool doesn't support wait_queue_multiple")
+
+        # HACK [adam Dec/6/14]: need to use our IOLoop/greenlet semaphore
+        #      implementation, so override what Pool.__init__ sets
+        #      self._socket_semaphore to here
+        self._socket_semaphore = GreenletBoundedSemaphore(self.max_size)
 
     def create_connection(self):
         """Copy of BasePool.connect()
@@ -265,6 +268,112 @@ class GreenletEvent(object):
             parent.switch()
 
         return self._flag
+
+class GreenletSemaphore(object):
+    """
+        Tornado IOLoop+Greenlet-based Semaphore class
+    """
+
+    def __init__(self, value=1, io_loop=None):
+        if value < 0:
+            raise ValueError("semaphore initial value must be >= 0")
+        print "starting at value %d" % value
+        self._value = value
+        self._waiters = []
+        self._waiter_timeouts = {}
+
+        self._ioloop = io_loop if io_loop else ioloop.IOLoop.instance()
+
+    def _handle_timeout(self, timeout_gr):
+        print "handling timeout"
+
+        self._waiters.remove(timeout_gr)
+        self._waiter_timeouts.remove(timeout_gr)
+        timeout_gr.switch()
+
+    def acquire(self, blocking=True, timeout=None):
+        if not blocking and timeout is not None:
+            raise ValueError("can't specify timeout for non-blocking acquire")
+
+        current = greenlet.getcurrent()
+        parent = current.parent
+        assert parent, "Must be called on child greenlet"
+
+        start_time = time.time()
+
+        # if the semaphore has a postive value, subtract 1 and return True
+        while True:
+            if self._value > 0:
+                self._value -= 1
+                return True
+
+            # otherwise, we don't get the semaphore...
+            if blocking:
+                self._waiters.append(current)
+                if timeout:
+                    callback = functools.partial(self._handle_timeout, current)
+                    self._waiter_timeouts[current] = \
+                            self._ioloop.add_timeout(time.time() + timeout,
+                                                     callback)
+
+                # yield back to the parent, returning when someone releases the
+                # semaphore
+                #
+                # because of the async nature of the way we yield back, we're
+                # not guaranteed to actually *get* the semaphore after returning
+                # here (someone else could acquire() between the release() and
+                # this greenlet getting rescheduled). so we go back to the loop
+                # and try again.
+                #
+                # this design is not strictly fair and it's possible for
+                # greenlets to starve, but it strikes me as unlikely in
+                # practice.
+                parent.switch()
+
+                # if we timed out, just return False instead of retrying
+                if timeout and (time.time() - start_time) >= timeout:
+                    print "timed out"
+                    return False
+
+            # non-blocking mode, just return False
+            else:
+                return False
+
+    __enter__ = acquire
+
+    def release(self):
+        self._value += 1
+
+        if self._waiters:
+            waiting_gr = self._waiters.pop(0)
+
+            # remove the timeout
+            if waiting_gr in self._waiter_timeouts:
+                timeout = self._waiter_timeouts.pop(waiting_gr)
+                self._ioloop.remove_timeout(timeout)
+
+            # schedule the waiting greenlet to try to acquire
+            self._ioloop.add_callback(waiting_gr.switch)
+
+    def __exit__(self, t, v, tb):
+        self.release()
+
+    @property
+    def counter(self):
+        return self._value
+
+
+class GreenletBoundedSemaphore(GreenletSemaphore):
+    """Semaphore that checks that # releases is <= # acquires"""
+    def __init__(self, value=1):
+        GreenletSemaphore.__init__(self, value)
+        self._initial_value = value
+
+    def release(self):
+        if self._value >= self._initial_value:
+            raise ValueError("Semaphore released too many times")
+        return GreenletSemaphore.release(self)
+
 
 
 class GreenletClient(object):
