@@ -288,7 +288,7 @@ class GreenletSemaphore(object):
         print "handling timeout"
 
         self._waiters.remove(timeout_gr)
-        self._waiter_timeouts.remove(timeout_gr)
+        self._waiter_timeouts.pop(timeout_gr)
         timeout_gr.switch()
 
     def acquire(self, blocking=True, timeout=None):
