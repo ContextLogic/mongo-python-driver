@@ -1,5 +1,6 @@
 image: ubuntu:14.04
-  
+
+### NOTE: This should run only for the 'green branch'
 upload_egg:
   script:
     # add git as part of the egg upload
@@ -27,4 +28,4 @@ upload_egg:
   #   - devpi use $INDEX
   #   - devpi upload
   # only:
-  #   - master
+  #   - green
