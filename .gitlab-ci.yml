@@ -26,7 +26,7 @@ upload_egg:
     - name_cl="name=\"$name_origin-green\""
     - sed -i "s/name=\"pymongo\"/$name_cl/g" setup.py
     - pip install .
-    - pip show pymongo
+    - pip show pymongo-green
     
   #   # Upload to Wish Pypi
   #   - devpi use $PYPI_SERVER
