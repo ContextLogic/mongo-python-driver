@@ -23,7 +23,7 @@ upload_egg:
     - (if [ "$(sed -n '/.*\(name\).*=.*\".*/p' setup.py | sed '/.*\"\(.*\)\".*/ s//\1/g' | wc -l)" == "1" ]; then echo "Found the name"; else echo "Fail"; exit 33; fi);
     # update name to put the branch name in it
     - name_origin=$(sed -n '/.*\(name\).*=.*\".*/p' setup.py | sed '/.*\"\(.*\)\".*/ s//\1/g')
-    - name_cl="name=\"$name_cl\","
+    - name_cl="name=\"$name_origin-green\","
     - sed -i "s/name=\"pymongo\"/$name_cl/g" setup.py
     - pip install .
     - pip show pymongo
