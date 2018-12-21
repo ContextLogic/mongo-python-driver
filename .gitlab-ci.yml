@@ -24,7 +24,7 @@ upload_egg:
     # update name to put the branch name in it
     - name_origin=$(sed -n '/.*\(name\).*=.*\".*/p' setup.py | sed '/.*\"\(.*\)\".*/ s//\1/g')
     - name_cl="$name_origin-green"
-    - sed -i "s/$name_origin/$name_cl/g" setup.py
+    - sed -i 's/name="pymongo",/name="$name_cl",/g' setup.py
     - pip install .
     - pip show pymongo
     
