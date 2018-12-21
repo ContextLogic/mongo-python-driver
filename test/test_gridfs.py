@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,26 +16,25 @@
 
 """Tests for the gridfs package.
 """
-import sys
-sys.path[0:0] = [""]
-
-from gridfs.grid_file import GridIn
-from pymongo.connection import Connection
-from pymongo.errors import AutoReconnect
-from pymongo.read_preferences import ReadPreference
-from test.test_replica_set_connection import TestConnectionReplicaSetBase
-
 import datetime
-import unittest
+import sys
 import threading
 import time
+import unittest
+import warnings
+
+sys.path[0:0] = [""]
+
 import gridfs
 
 from bson.py3compat import b, StringIO
-from gridfs.errors import (FileExists,
-                           NoFile)
-from test.test_connection import get_connection
-from test.utils import joinall
+from gridfs.errors import (FileExists, NoFile)
+from pymongo.errors import ConnectionFailure
+from pymongo.mongo_client import MongoClient
+from pymongo.read_preferences import ReadPreference
+from test.test_client import get_client
+from test.test_replica_set_client import TestReplicaSetClientBase
+from test.utils import catch_warnings, joinall
 
 
 class JustWrite(threading.Thread):
@@ -73,13 +72,16 @@ class JustRead(threading.Thread):
 class TestGridfs(unittest.TestCase):
 
     def setUp(self):
-        self.db = get_connection().pymongo_test
+        self.db = get_client().pymongo_test
         self.db.drop_collection("fs.files")
         self.db.drop_collection("fs.chunks")
         self.db.drop_collection("alt.files")
         self.db.drop_collection("alt.chunks")
         self.fs = gridfs.GridFS(self.db)
         self.alt = gridfs.GridFS(self.db, "alt")
+
+    def tearDown(self):
+        self.db = self.fs = self.alt = None
 
     def test_gridfs(self):
         self.assertRaises(TypeError, gridfs.GridFS, "foo")
@@ -106,6 +108,11 @@ class TestGridfs(unittest.TestCase):
         self.fs.put(b("hello world"))
         self.assertEqual([], self.fs.list())
 
+        # PYTHON-598: in server versions before 2.5.x, creating an index on
+        # filename, uploadDate causes list() to include None.
+        self.fs.get_last_version()
+        self.assertEqual([], self.fs.list())
+
         self.fs.put(b(""), filename="mike")
         self.fs.put(b("foo"), filename="test")
         self.fs.put(b(""), filename="hello world")
@@ -123,7 +130,7 @@ class TestGridfs(unittest.TestCase):
         self.assertEqual(0, raw["length"])
         self.assertEqual(oid, raw["_id"])
         self.assertTrue(isinstance(raw["uploadDate"], datetime.datetime))
-        self.assertEqual(256 * 1024, raw["chunkSize"])
+        self.assertEqual(255 * 1024, raw["chunkSize"])
         self.assertTrue(isinstance(raw["md5"], basestring))
 
     def test_alt_collection(self):
@@ -271,7 +278,7 @@ class TestGridfs(unittest.TestCase):
         self.assertEqual(b("hello world"), self.fs.get(oid).read())
 
     def test_file_exists(self):
-        db = get_connection(w=1).pymongo_test
+        db = get_client(w=1).pymongo_test
         fs = gridfs.GridFS(db)
 
         oid = fs.put(b("hello"))
@@ -351,31 +358,48 @@ class TestGridfs(unittest.TestCase):
             self.db.fs.files.find({'filename':'test'}).count()
         )
 
-
-class TestGridfsRequest(unittest.TestCase):
-
-    def setUp(self):
-        # TODO: merge this into TestGridfs as we update all tests to use
-        #   MongoClient instead of Connection
-        from pymongo.mongo_client import MongoClient
-        from test.test_connection import host, port
-
-        # MongoClient defaults to w=1, auto_start_request=False
-        self.db = MongoClient(host, port, w=0).pymongo_test
-        self.db.drop_collection("fs.files")
-        self.db.drop_collection("fs.chunks")
-        self.fs = gridfs.GridFS(self.db)
-
     def test_gridfs_request(self):
         self.assertFalse(self.db.connection.in_request())
         self.fs.put(b("hello world"))
         # Request started and ended by put(), we're back to original state
         self.assertFalse(self.db.connection.in_request())
 
+    def test_gridfs_lazy_connect(self):
+        client = MongoClient('badhost', _connect=False)
+        db = client.db
+        self.assertRaises(ConnectionFailure, gridfs.GridFS, db)
 
-class TestGridfsReplicaSet(TestConnectionReplicaSetBase):
+        fs = gridfs.GridFS(db, _connect=False)
+        f = fs.new_file()  # Still no connection.
+        self.assertRaises(ConnectionFailure, f.close)
+
+    def test_gridfs_find(self):
+        self.fs.put(b("test2"), filename="two")
+        time.sleep(0.01)
+        self.fs.put(b("test2+"), filename="two")
+        time.sleep(0.01)
+        self.fs.put(b("test1"), filename="one")
+        time.sleep(0.01)
+        self.fs.put(b("test2++"), filename="two")
+        self.assertEqual(3, self.fs.find({"filename":"two"}).count())
+        self.assertEqual(4, self.fs.find().count())
+        cursor = self.fs.find(timeout=False).sort("uploadDate", -1).skip(1).limit(2)
+        # 2to3 hint...
+        gout = cursor.next()
+        self.assertEqual(b("test1"), gout.read())
+        cursor.rewind()
+        gout = cursor.next()
+        self.assertEqual(b("test1"), gout.read())
+        gout = cursor.next()
+        self.assertEqual(b("test2+"), gout.read())
+        self.assertRaises(StopIteration, cursor.next)
+        cursor.close()
+        self.assertRaises(TypeError, self.fs.find, {}, {"_id": True})
+
+
+class TestGridfsReplicaSet(TestReplicaSetClientBase):
     def test_gridfs_replica_set(self):
-        rsc = self._get_connection(
+        rsc = self._get_client(
             w=self.w, wtimeout=5000,
             read_preference=ReadPreference.SECONDARY)
 
@@ -389,26 +413,47 @@ class TestGridfsReplicaSet(TestConnectionReplicaSetBase):
 
     def test_gridfs_secondary(self):
         primary_host, primary_port = self.primary
-        primary_connection = Connection(primary_host, primary_port)
+        primary_connection = MongoClient(primary_host, primary_port)
 
         secondary_host, secondary_port = self.secondaries[0]
-        for secondary_connection in [
-            Connection(secondary_host, secondary_port, slave_okay=True),
-            Connection(secondary_host, secondary_port,
-                read_preference=ReadPreference.SECONDARY),
+        ctx = catch_warnings()
+        try:
+            warnings.simplefilter("ignore", DeprecationWarning)
+            for secondary_connection in [
+                MongoClient(secondary_host, secondary_port, slave_okay=True),
+                MongoClient(secondary_host, secondary_port,
+                            read_preference=ReadPreference.SECONDARY),
             ]:
-            primary_connection.pymongo_test.drop_collection("fs.files")
-            primary_connection.pymongo_test.drop_collection("fs.chunks")
+                primary_connection.pymongo_test.drop_collection("fs.files")
+                primary_connection.pymongo_test.drop_collection("fs.chunks")
 
-            # Should detect it's connected to secondary and not attempt to
-            # create index
-            fs = gridfs.GridFS(secondary_connection.pymongo_test)
+                # Should detect it's connected to secondary and not attempt to
+                # create index
+                fs = gridfs.GridFS(secondary_connection.pymongo_test)
 
-            # This won't detect secondary, raises error
-            self.assertRaises(AutoReconnect, fs.put, b('foo'))
+                # This won't detect secondary, raises error
+                self.assertRaises(ConnectionFailure, fs.put, b('foo'))
+        finally:
+            ctx.exit()
+
+    def test_gridfs_secondary_lazy(self):
+        # Should detect it's connected to secondary and not attempt to
+        # create index.
+        secondary_host, secondary_port = self.secondaries[0]
+        client = MongoClient(
+            secondary_host, secondary_port,
+            read_preference=ReadPreference.SECONDARY,
+            _connect=False)
+
+        # Still no connection.
+        fs = gridfs.GridFS(client.test_gridfs_secondary_lazy, _connect=False)
+
+        # Connects, doesn't create index.
+        self.assertRaises(NoFile, fs.get_last_version)
+        self.assertRaises(ConnectionFailure, fs.put, 'data')
 
     def tearDown(self):
-        rsc = self._get_connection()
+        rsc = self._get_client()
         rsc.pymongo_test.drop_collection('fs.files')
         rsc.pymongo_test.drop_collection('fs.chunks')
         rsc.close()

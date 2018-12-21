@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,10 +22,6 @@ from bson.code import Code
 
 
 class TestCode(unittest.TestCase):
-
-    def setUp(self):
-        pass
-
     def test_types(self):
         self.assertRaises(TypeError, Code, 5)
         self.assertRaises(TypeError, Code, None)

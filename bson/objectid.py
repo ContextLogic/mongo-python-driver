@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,6 +64,8 @@ class ObjectId(object):
     _machine_bytes = _machine_bytes()
 
     __slots__ = ('__id')
+
+    _type_marker = 7
 
     def __init__(self, oid=None):
         """Initialize a new ObjectId.
@@ -138,6 +140,9 @@ class ObjectId(object):
 
         .. versionadded:: 2.3
         """
+        if not oid:
+            return False
+
         try:
             ObjectId(oid)
             return True
@@ -244,7 +249,9 @@ class ObjectId(object):
             self.__id = oid
 
     def __str__(self):
-        return binascii.hexlify(self.__id).decode()
+        if PY3:
+            return binascii.hexlify(self.__id).decode()
+        return binascii.hexlify(self.__id)
 
     def __repr__(self):
         return "ObjectId('%s')" % (str(self),)

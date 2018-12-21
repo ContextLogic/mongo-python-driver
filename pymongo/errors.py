@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,11 @@
 """Exceptions raised by PyMongo."""
 
 from bson.errors import *
+
+try:
+    from ssl import CertificateError
+except ImportError:
+    from pymongo.ssl_match_hostname import CertificateError
 
 
 class PyMongoError(Exception):
@@ -52,19 +57,70 @@ class ConfigurationError(PyMongoError):
 class OperationFailure(PyMongoError):
     """Raised when a database operation fails.
 
+    .. versionadded:: 2.7
+       The :attr:`details` attribute.
+
     .. versionadded:: 1.8
        The :attr:`code` attribute.
     """
 
-    def __init__(self, error, code=None):
-        self.code = code
+    def __init__(self, error, code=None, details=None):
+        self.__code = code
+        self.__details = details
         PyMongoError.__init__(self, error)
+
+    @property
+    def code(self):
+        """The error code returned by the server, if any.
+        """
+        return self.__code
+
+    @property
+    def details(self):
+        """The complete error document returned by the server.
+
+        Depending on the error that occurred, the error document
+        may include useful information beyond just the error
+        message. When connected to a mongos the error document
+        may contain one or more subdocuments if errors occurred
+        on multiple shards.
+        """
+        return self.__details
+
+
+class CursorNotFound(OperationFailure):
+    """Raised while iterating query results if the cursor is
+    invalidated on the server.
+
+    .. versionadded:: 2.7
+    """
+
+
+class ExecutionTimeout(OperationFailure):
+    """Raised when a database operation times out, exceeding the $maxTimeMS
+    set in the query or command option.
+
+    .. note:: Requires server version **>= 2.6.0**
+
+    .. versionadded:: 2.7
+    """
 
 
 class TimeoutError(OperationFailure):
-    """Raised when a database operation times out.
+    """DEPRECATED - will be removed in PyMongo 3.0. See WTimeoutError instead.
 
     .. versionadded:: 1.8
+    """
+
+
+class WTimeoutError(TimeoutError):
+    """Raised when a database operation times out (i.e. wtimeout expires)
+    before replication completes.
+
+    With newer versions of MongoDB the `details` attribute may include
+    write concern fields like 'n', 'updatedExisting', or 'writtenTo'.
+
+    .. versionadded:: 2.7
     """
 
 
@@ -75,6 +131,16 @@ class DuplicateKeyError(OperationFailure):
 
     .. versionadded:: 1.4
     """
+
+
+class BulkWriteError(OperationFailure):
+    """Exception class for bulk write errors.
+
+    .. versionadded:: 2.7
+    """
+    def __init__(self, results):
+        OperationFailure.__init__(
+            self, "batch op errors occurred", 65, results)
 
 
 class InvalidOperation(PyMongoError):
@@ -98,8 +164,24 @@ class InvalidURI(ConfigurationError):
     .. versionadded:: 1.5
     """
 
+
 class UnsupportedOption(ConfigurationError):
     """Exception for unsupported options.
 
     .. versionadded:: 2.0
     """
+
+
+class ExceededMaxWaiters(Exception):
+    """Raised when a thread tries to get a connection from a pool and
+    ``max_pool_size * waitQueueMultiple`` threads are already waiting.
+
+    .. versionadded:: 2.6
+    """
+    pass
+
+
+class DocumentTooLarge(InvalidDocument):
+    """Raised when an encoded document is too large for the connected server.
+    """
+    pass

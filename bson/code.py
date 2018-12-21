@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,6 +38,8 @@ class Code(str):
     .. versionadded:: 1.9
        Ability to pass scope values using keyword arguments.
     """
+
+    _type_marker = 13
 
     def __new__(cls, code, scope=None, **kwargs):
         if not isinstance(code, basestring):

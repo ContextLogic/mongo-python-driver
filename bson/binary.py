@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -126,6 +126,8 @@ class Binary(binary_type):
         <http://bsonspec.org/#/specification>`_
         to use
     """
+
+    _type_marker = 5
 
     def __new__(cls, data, subtype=BINARY_SUBTYPE):
         if not isinstance(data, binary_type):

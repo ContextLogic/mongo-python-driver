@@ -1,4 +1,4 @@
-# Copyright 2010-2012 10gen, Inc.
+# Copyright 2010-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ UPPERBOUND = 4294967296
 class Timestamp(object):
     """MongoDB internal timestamps used in the opLog.
     """
+
+    _type_marker = 17
 
     def __init__(self, time, inc):
         """Create a new :class:`Timestamp`.
@@ -83,6 +85,26 @@ class Timestamp(object):
 
     def __ne__(self, other):
         return not self == other
+
+    def __lt__(self, other):
+        if isinstance(other, Timestamp):
+            return (self.time, self.inc) < (other.time, other.inc)
+        return NotImplemented
+
+    def __le__(self, other):
+        if isinstance(other, Timestamp):
+            return (self.time, self.inc) <= (other.time, other.inc)
+        return NotImplemented
+
+    def __gt__(self, other):
+        if isinstance(other, Timestamp):
+            return (self.time, self.inc) > (other.time, other.inc)
+        return NotImplemented
+
+    def __ge__(self, other):
+        if isinstance(other, Timestamp):
+            return (self.time, self.inc) >= (other.time, other.inc)
+        return NotImplemented
 
     def __repr__(self):
         return "Timestamp(%s, %s)" % (self.__time, self.__inc)

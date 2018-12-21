@@ -27,7 +27,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'PyMongo'
-copyright = u'2008 - 2012, 10gen, Inc.'
+copyright = u'2008 - 2014, MongoDB, Inc.'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -71,9 +71,9 @@ doctest_test_doctest_blocks = False
 
 doctest_global_setup = """
 from pymongo.mongo_client import MongoClient
-connection = MongoClient()
-connection.drop_database("doctest_test")
-db = connection.doctest_test
+client = MongoClient()
+client.drop_database("doctest_test")
+db = client.doctest_test
 """
 
 # -- Options for HTML output ---------------------------------------------------

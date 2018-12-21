@@ -63,8 +63,9 @@ To initialize the set we need to connect to a single node and run the
 initiate command. Since we don't have a primary yet, we'll need to
 tell PyMongo that it's okay to connect to a slave/secondary::
 
-  >>> from pymongo import MongoClient
-  >>> c = MongoClient("morton.local:27017", slave_okay=True)
+  >>> from pymongo import MongoClient, ReadPreference
+  >>> c = MongoClient("morton.local:27017",
+                      read_preference=ReadPreference.SECONDARY)
 
 .. note:: We could have connected to any of the other nodes instead,
    but only the node we initiate from is allowed to contain any
@@ -183,7 +184,7 @@ the primary member of the replica set. To use secondaries for queries
 we have to change the :class:`~pymongo.read_preferences.ReadPreference`::
 
   >>> db = MongoReplicaSetClient("morton.local:27017", replicaSet='foo').test
-  >>> from pymongo.read_preference import ReadPreference
+  >>> from pymongo.read_preferences import ReadPreference
   >>> db.read_preference = ReadPreference.SECONDARY_PREFERRED
 
 Now all queries will be sent to the secondary members of the set. If there are
@@ -193,7 +194,7 @@ using the ``SECONDARY`` read preference::
 
   >>> db.read_preference = ReadPreference.SECONDARY
 
-Read preference can be set on a connection, database, collection, or on a
+Read preference can be set on a client, database, collection, or on a
 per-query basis, e.g.::
 
   >>> db.collection.find_one(read_preference=ReadPreference.PRIMARY)
@@ -257,6 +258,12 @@ higher latencies by setting ``secondary_acceptable_latency_ms`` to a larger
 number. In that case, MongoReplicaSetClient distributes reads among matching
 members within ``secondary_acceptable_latency_ms`` of the closest member's
 ping time.
+
+.. note:: ``secondary_acceptable_latency_ms`` is ignored when talking to a
+  replica set *through* a mongos. The equivalent is the localThreshold_ command
+  line option.
+
+.. _localThreshold: http://docs.mongodb.org/manual/reference/mongos/#cmdoption-mongos--localThreshold
 
 Health Monitoring
 '''''''''''''''''

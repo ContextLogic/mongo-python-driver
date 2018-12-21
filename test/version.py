@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,9 +47,9 @@ def _parse_version_string(version_string):
 
 
 # Note this is probably broken for very old versions of the database...
-def version(connection):
-    return _parse_version_string(connection.server_info()["version"])
+def version(client):
+    return _parse_version_string(client.server_info()["version"])
 
 
-def at_least(connection, min_version):
-    return version(connection) >= tuple(_padded(min_version, 4))
+def at_least(client, min_version):
+    return version(client) >= tuple(_padded(min_version, 4))

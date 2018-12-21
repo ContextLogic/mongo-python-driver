@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,12 +32,15 @@ from bson.dbref import DBRef
 from bson.max_key import MaxKey
 from bson.min_key import MinKey
 from bson.objectid import ObjectId
+from bson.regex import Regex
+from bson.son import RE_TYPE
 from bson.timestamp import Timestamp
 from bson.tz_util import utc
 
-from test.test_connection import get_connection
+from test.test_client import get_client
 
 PY3 = sys.version_info[0] == 3
+PY24 = sys.version_info[:2] == (2, 4)
 
 
 class TestJsonUtil(unittest.TestCase):
@@ -46,7 +49,10 @@ class TestJsonUtil(unittest.TestCase):
         if not json_util.json_lib:
             raise SkipTest("No json or simplejson module")
 
-        self.db = get_connection().pymongo_test
+        self.db = get_client().pymongo_test
+
+    def tearDown(self):
+        self.db = None
 
     def round_tripped(self, doc):
         return json_util.loads(json_util.dumps(doc))
@@ -64,21 +70,77 @@ class TestJsonUtil(unittest.TestCase):
         self.round_trip({"ref": DBRef("foo", 5)})
         self.round_trip({"ref": DBRef("foo", 5, "db")})
         self.round_trip({"ref": DBRef("foo", ObjectId())})
-        self.round_trip({"ref": DBRef("foo", ObjectId(), "db")})
+
+        if not PY24:
+            # Check order.
+            self.assertEqual(
+                '{"$ref": "collection", "$id": 1, "$db": "db"}',
+                json_util.dumps(DBRef('collection', 1, 'db')))
 
     def test_datetime(self):
         # only millis, not micros
         self.round_trip({"date": datetime.datetime(2009, 12, 9, 15,
                                                    49, 45, 191000, utc)})
 
+    def test_regex_object_hook(self):
+        # simplejson or the builtin json module.
+        from bson.json_util import json
+
+        # Extended JSON format regular expression.
+        pat = 'a*b'
+        json_re = '{"$regex": "%s", "$options": "u"}' % pat
+        loaded = json_util.object_hook(json.loads(json_re))
+        self.assertTrue(isinstance(loaded, RE_TYPE))
+        self.assertEqual(pat, loaded.pattern)
+        self.assertEqual(re.U, loaded.flags)
+
+        loaded = json_util.object_hook(json.loads(json_re), compile_re=False)
+        self.assertTrue(isinstance(loaded, Regex))
+        self.assertEqual(pat, loaded.pattern)
+        self.assertEqual(re.U, loaded.flags)
+
     def test_regex(self):
-        res = self.round_tripped({"r": re.compile("a*b", re.IGNORECASE)})["r"]
-        self.assertEqual("a*b", res.pattern)
+        for regex_instance in (
+                re.compile("a*b", re.IGNORECASE),
+                Regex("a*b", re.IGNORECASE)):
+            res = self.round_tripped({"r": regex_instance})["r"]
+
+            self.assertEqual("a*b", res.pattern)
+            res = self.round_tripped({"r": Regex("a*b", re.IGNORECASE)})["r"]
+            self.assertEqual("a*b", res.pattern)
+            if PY3:
+                # re.UNICODE is a default in python 3.
+                self.assertEqual(re.IGNORECASE | re.UNICODE, res.flags)
+            else:
+                self.assertEqual(re.IGNORECASE, res.flags)
+
+        all_options = re.I|re.L|re.M|re.S|re.U|re.X
+        regex = re.compile("a*b", all_options)
+        res = self.round_tripped({"r": regex})["r"]
+        self.assertEqual(all_options, res.flags)
+
+        # Some tools may not add $options if no flags are set.
+        res = json_util.loads('{"r": {"$regex": "a*b"}}')['r']
+        expected_flags = 0
         if PY3:
-            # re.UNICODE is a default in python 3.
-            self.assertEqual(re.IGNORECASE | re.UNICODE, res.flags)
-        else:
-            self.assertEqual(re.IGNORECASE, res.flags)
+            expected_flags = re.U
+        self.assertEqual(expected_flags, res.flags)
+
+        self.assertEqual(
+            Regex('.*', 'ilm'),
+            json_util.loads(
+                '{"r": {"$regex": ".*", "$options": "ilm"}}',
+                compile_re=False)['r'])
+
+        if not PY24:
+            # Check order.
+            self.assertEqual(
+                '{"$regex": ".*", "$options": "mx"}',
+                json_util.dumps(Regex('.*', re.M | re.X)))
+
+            self.assertEqual(
+                '{"$regex": ".*", "$options": "mx"}',
+                json_util.dumps(re.compile(b('.*'), re.M | re.X)))
 
     def test_minkey(self):
         self.round_trip({"m": MinKey()})
@@ -87,9 +149,12 @@ class TestJsonUtil(unittest.TestCase):
         self.round_trip({"m": MaxKey()})
 
     def test_timestamp(self):
-        res = json_util.json.dumps({"ts": Timestamp(4, 13)},
-                                     default=json_util.default)
-        dct = json_util.json.loads(res)
+        res = json_util.dumps({"ts": Timestamp(4, 13)}, default=json_util.default)
+        if not PY24:
+            # Check order.
+            self.assertEqual('{"ts": {"t": 4, "i": 13}}', res)
+
+        dct = json_util.loads(res)
         self.assertEqual(dct['ts']['t'], 4)
         self.assertEqual(dct['ts']['i'], 13)
 
@@ -118,7 +183,13 @@ class TestJsonUtil(unittest.TestCase):
             json_util.loads('{"bin": {"$type": 0, "$binary": "AAECAwQ="}}'))
 
         json_bin_dump = json_util.dumps(md5_type_dict)
-        self.assertTrue('"$type": "05"' in json_bin_dump)
+        if not PY24:
+            # Check order.
+            self.assertEqual(
+                '{"md5": {"$binary": "IG43GK8JL9HRL4DK53HMrA==",'
+                + ' "$type": "05"}}',
+                json_bin_dump)
+
         self.assertEqual(md5_type_dict,
             json_util.loads('{"md5": {"$type": 5, "$binary":'
                             ' "IG43GK8JL9HRL4DK53HMrA=="}}'))
@@ -140,7 +211,14 @@ class TestJsonUtil(unittest.TestCase):
 
     def test_code(self):
         self.round_trip({"code": Code("function x() { return 1; }")})
-        self.round_trip({"code": Code("function y() { return z; }", z=2)})
+
+        code = Code("return z", z=2)
+        res = json_util.dumps(code)
+        self.assertEqual(code, json_util.loads(res))
+
+        if not PY24:
+            # Check order.
+            self.assertEqual('{"$code": "return z", "$scope": {"z": 2}}', res)
 
     def test_cursor(self):
         db = self.db

@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -44,7 +44,7 @@ class Connection(MongoClient):
     """Connection to MongoDB.
     """
 
-    def __init__(self, host=None, port=None, max_pool_size=10,
+    def __init__(self, host=None, port=None, max_pool_size=None,
                  network_timeout=None, document_class=dict,
                  tz_aware=False, _connect=True, **kwargs):
         """Create a new connection to a single MongoDB instance at *host:port*.
@@ -84,8 +84,10 @@ class Connection(MongoClient):
             it must be enclosed in '[' and ']' characters following
             the RFC2732 URL syntax (e.g. '[::1]' for localhost)
           - `port` (optional): port number on which to connect
-          - `max_pool_size` (optional): The maximum size limit for
-            the connection pool.
+          - `max_pool_size` (optional): The maximum number of connections
+            that the pool will open simultaneously. If this is set, operations
+            will block if there are `max_pool_size` outstanding connections
+            from the pool. By default the pool size is unlimited.
           - `network_timeout` (optional): timeout (in seconds) to use
             for socket operations - default is no timeout
           - `document_class` (optional): default class to use for
@@ -95,7 +97,30 @@ class Connection(MongoClient):
             in a document by this :class:`Connection` will be timezone
             aware (otherwise they will be naive)
 
-          **Other optional parameters can be passed as keyword arguments:**
+          | **Other optional parameters can be passed as keyword arguments:**
+
+          - `socketTimeoutMS`: (integer) How long (in milliseconds) a send or
+            receive on a socket can take before timing out. Defaults to ``None``
+            (no timeout).
+          - `connectTimeoutMS`: (integer) How long (in milliseconds) a
+            connection can take to be opened before timing out. Defaults to
+            ``20000``.
+          - `waitQueueTimeoutMS`: (integer) How long (in milliseconds) a
+            thread will wait for a socket from the pool if the pool has no
+            free sockets. Defaults to ``None`` (no timeout).
+          - `waitQueueMultiple`: (integer) Multiplied by max_pool_size to give
+            the number of threads allowed to wait for a socket at one time.
+            Defaults to ``None`` (no waiters).
+
+          - `auto_start_request`: If ``True`` (the default), each thread that
+            accesses this Connection has a socket allocated to it for the
+            thread's lifetime.  This ensures consistent reads, even if you read
+            after an unsafe write.
+          - `use_greenlets`: if ``True``, :meth:`start_request()` will ensure
+            that the current greenlet uses the same socket for all operations
+            until :meth:`end_request()`
+
+          | **Write Concern options:**
 
           - `safe`: :class:`Connection` **disables** acknowledgement of write
             operations. Use ``safe=True`` to enable write acknowledgement.
@@ -109,34 +134,65 @@ class Connection(MongoClient):
             to complete. If replication does not complete in the given
             timeframe, a timeout exception is raised. Implies safe=True.
           - `j`: If ``True`` block until write operations have been committed
-            to the journal. Ignored if the server is running without journaling.
-            Implies safe=True.
-          - `fsync`: If ``True`` force the database to fsync all files before
-            returning. When used with `j` the server awaits the next group
-            commit before returning. Implies safe=True.
-          - `replicaSet`: (string) The name of the replica set to connect to.
-            The driver will verify that the replica set it connects to matches
-            this name. Implies that the hosts specified are a seed list and the
-            driver should attempt to find all members of the set.
-          - `socketTimeoutMS`: (integer) How long (in milliseconds) a send or
-            receive on a socket can take before timing out.
-          - `connectTimeoutMS`: (integer) How long (in milliseconds) a
-            connection can take to be opened before timing out.
-          - `ssl`: If ``True``, create the connection to the server using SSL.
-          - `read_preference`: The read preference for this connection.
-            See :class:`~pymongo.read_preferences.ReadPreference` for available
-            options.
-          - `auto_start_request`: If ``True`` (the default), each thread that
-            accesses this Connection has a socket allocated to it for the
-            thread's lifetime.  This ensures consistent reads, even if you read
-            after an unsafe write.
-          - `use_greenlets`: if ``True``, :meth:`start_request()` will ensure
-            that the current greenlet uses the same socket for all operations
-            until :meth:`end_request()`
+            to the journal. Cannot be used in combination with `fsync`. Prior
+            to MongoDB 2.6 this option was ignored if the server was running
+            without journaling. Starting with MongoDB 2.6 write operations will
+            fail with an exception if this option is used when the server is
+            running without journaling. Implies safe=True.
+          - `fsync`: If ``True`` and the server is running without journaling,
+            blocks until the server has synced all data files to disk. If the
+            server is running with journaling, this acts the same as the `j`
+            option, blocking until write operations have been committed to the
+            journal. Cannot be used in combination with `j`. Implies safe=True.
+
+          | **Replica-set keyword arguments for connecting with a replica-set
+            - either directly or via a mongos:**
+          | (ignored by standalone mongod instances)
+
           - `slave_okay` or `slaveOk` (deprecated): Use `read_preference`
             instead.
+          - `replicaSet`: (string) The name of the replica-set to connect to.
+            The driver will verify that the replica-set it connects to matches
+            this name. Implies that the hosts specified are a seed list and the
+            driver should attempt to find all members of the set. *Ignored by
+            mongos*.
+          - `read_preference`: The read preference for this client. If
+            connecting to a secondary then a read preference mode *other* than
+            PRIMARY is required - otherwise all queries will throw a
+            :class:`~pymongo.errors.AutoReconnect` "not master" error.
+            See :class:`~pymongo.read_preferences.ReadPreference` for all
+            available read preference options.
+          - `tag_sets`: Ignored unless connecting to a replica-set via mongos.
+            Specify a priority-order for tag sets, provide a list of
+            tag sets: ``[{'dc': 'ny'}, {'dc': 'la'}, {}]``. A final, empty tag
+            set, ``{}``, means "read from any member that matches the mode,
+            ignoring tags.
+
+          | **SSL configuration:**
+
+          - `ssl`: If ``True``, create the connection to the server using SSL.
+          - `ssl_keyfile`: The private keyfile used to identify the local
+            connection against mongod.  If included with the ``certfile` then
+            only the ``ssl_certfile`` is needed.  Implies ``ssl=True``.
+          - `ssl_certfile`: The certificate file used to identify the local
+            connection against mongod. Implies ``ssl=True``.
+          - `ssl_cert_reqs`: The parameter cert_reqs specifies whether a
+            certificate is required from the other side of the connection,
+            and whether it will be validated if provided. It must be one of the
+            three values ``ssl.CERT_NONE`` (certificates ignored),
+            ``ssl.CERT_OPTIONAL`` (not required, but validated if provided), or
+            ``ssl.CERT_REQUIRED`` (required and validated). If the value of
+            this parameter is not ``ssl.CERT_NONE``, then the ``ssl_ca_certs``
+            parameter must point to a file of CA certificates.
+            Implies ``ssl=True``.
+          - `ssl_ca_certs`: The ca_certs file contains a set of concatenated
+            "certification authority" certificates, which are used to validate
+            certificates passed from the other end of the connection.
+            Implies ``ssl=True``.
 
         .. seealso:: :meth:`end_request`
+        .. versionchanged:: 2.5
+           Added additional ssl options
         .. versionchanged:: 2.3
            Added support for failover between mongos seed list members.
         .. versionchanged:: 2.2

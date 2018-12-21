@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,14 +20,17 @@ import os
 
 from bson.binary import Binary
 from bson.objectid import ObjectId
-from bson.py3compat import b, binary_type, string_types, text_type, StringIO
+from bson.py3compat import (b, binary_type, next_item,
+                            string_types, text_type, StringIO)
 from gridfs.errors import (CorruptGridFile,
                            FileExists,
                            NoFile,
                            UnsupportedAPI)
 from pymongo import ASCENDING
 from pymongo.collection import Collection
+from pymongo.cursor import Cursor
 from pymongo.errors import DuplicateKeyError
+from pymongo.read_preferences import ReadPreference
 
 try:
     _SEEK_SET = os.SEEK_SET
@@ -43,7 +46,8 @@ EMPTY = b("")
 NEWLN = b("\n")
 
 """Default chunk size, in bytes."""
-DEFAULT_CHUNK_SIZE = 256 * 1024
+# Slightly under a power of 2, to work well with server's record allocations.
+DEFAULT_CHUNK_SIZE = 255 * 1024
 
 
 def _create_property(field_name, docstring,
@@ -122,7 +126,7 @@ class GridIn(object):
            >>> from pymongo import MongoClient
            >>> from gridfs import GridFS
            >>> client = MongoClient(w=0) # turn off write acknowledgment
-           >>> fs = GridFS(client)
+           >>> fs = GridFS(client.database)
            >>> gridin = fs.new_file()
            >>> request = client.start_request()
            >>> try:
@@ -152,10 +156,6 @@ class GridIn(object):
         # Defaults
         kwargs["_id"] = kwargs.get("_id", ObjectId())
         kwargs["chunkSize"] = kwargs.get("chunkSize", DEFAULT_CHUNK_SIZE)
-
-        root_collection.chunks.ensure_index([("files_id", ASCENDING),
-                                             ("n", ASCENDING)],
-                                            unique=True)
         object.__setattr__(self, "_coll", root_collection)
         object.__setattr__(self, "_chunks", root_collection.chunks)
         object.__setattr__(self, "_file", kwargs)
@@ -163,6 +163,14 @@ class GridIn(object):
         object.__setattr__(self, "_position", 0)
         object.__setattr__(self, "_chunk_number", 0)
         object.__setattr__(self, "_closed", False)
+        object.__setattr__(self, "_ensured_index", False)
+
+    def _ensure_index(self):
+        if not object.__getattribute__(self, "_ensured_index"):
+            self._coll.chunks.ensure_index(
+                [("files_id", ASCENDING), ("n", ASCENDING)],
+                unique=True)
+            object.__setattr__(self, "_ensured_index", True)
 
     @property
     def closed(self):
@@ -209,6 +217,10 @@ class GridIn(object):
     def __flush_data(self, data):
         """Flush `data` to a chunk.
         """
+        # Ensure the index, even if there's nothing to write, so
+        # the filemd5 command always succeeds.
+        self._ensure_index()
+
         if not data:
             return
         assert(len(data) <= self.chunk_size)
@@ -247,7 +259,8 @@ class GridIn(object):
             db.error()
 
             md5 = db.command(
-                "filemd5", self._id, root=self._coll.name)["md5"]
+                "filemd5", self._id, root=self._coll.name,
+                read_preference=ReadPreference.PRIMARY)["md5"]
 
             self._file["md5"] = md5
             self._file["length"] = self._position
@@ -358,7 +371,8 @@ class GridIn(object):
 class GridOut(object):
     """Class to read data out of GridFS.
     """
-    def __init__(self, root_collection, file_id=None, file_document=None):
+    def __init__(self, root_collection, file_id=None, file_document=None,
+                 _connect=True):
         """Read a file from GridFS
 
         Application developers should generally not need to
@@ -383,16 +397,13 @@ class GridOut(object):
                             "instance of Collection")
 
         self.__chunks = root_collection.chunks
-
-        files = root_collection.files
-        self._file = file_document or files.find_one({"_id": file_id})
-
-        if not self._file:
-            raise NoFile("no file in gridfs collection %r with _id %r" %
-                         (files, file_id))
-
+        self.__files = root_collection.files
+        self.__file_id = file_id
         self.__buffer = EMPTY
         self.__position = 0
+        self._file = file_document
+        if _connect:
+            self._ensure_file()
 
     _id = _create_property("_id", "The ``'_id'`` value for this file.", True)
     filename = _create_property("filename", "Name of this file.", True)
@@ -413,10 +424,40 @@ class GridOut(object):
     md5 = _create_property("md5", "MD5 of the contents of this file "
                             "(generated on the server).", True)
 
+    def _ensure_file(self):
+        if not self._file:
+            self._file = self.__files.find_one({"_id": self.__file_id})
+            if not self._file:
+                raise NoFile("no file in gridfs collection %r with _id %r" %
+                             (self.__files, self.__file_id))
+
     def __getattr__(self, name):
+        self._ensure_file()
         if name in self._file:
             return self._file[name]
         raise AttributeError("GridOut object has no attribute '%s'" % name)
+
+    def readchunk(self):
+        """Reads a chunk at a time. If the current position is within a
+        chunk the remainder of the chunk is returned.
+        """
+        received = len(self.__buffer)
+        chunk_data = EMPTY
+
+        if received > 0:
+            chunk_data = self.__buffer
+        elif self.__position < int(self.length):
+            chunk_number = int((received + self.__position) / self.chunk_size)
+            chunk = self.__chunks.find_one({"files_id": self._id,
+                                            "n": chunk_number})
+            if not chunk:
+                raise CorruptGridFile("no chunk #%d" % chunk_number)
+
+            chunk_data = chunk["data"][self.__position % self.chunk_size:]
+
+        self.__position += len(chunk_data)
+        self.__buffer = EMPTY
+        return chunk_data
 
     def read(self, size=-1):
         """Read at most `size` bytes from the file (less if there
@@ -428,37 +469,29 @@ class GridOut(object):
         :Parameters:
           - `size` (optional): the number of bytes to read
         """
+        self._ensure_file()
+
         if size == 0:
-            return ""
+            return EMPTY
 
         remainder = int(self.length) - self.__position
         if size < 0 or size > remainder:
             size = remainder
 
-        received = len(self.__buffer)
-        chunk_number = int((received + self.__position) / self.chunk_size)
-        chunks = []
-
+        received = 0
+        data = StringIO()
         while received < size:
-            chunk = self.__chunks.find_one({"files_id": self._id,
-                                            "n": chunk_number})
-            if not chunk:
-                raise CorruptGridFile("no chunk #%d" % chunk_number)
-
-            if received:
-                chunk_data = chunk["data"]
-            else:
-                chunk_data = chunk["data"][self.__position % self.chunk_size:]
-
+            chunk_data = self.readchunk()
             received += len(chunk_data)
-            chunks.append(chunk_data)
-            chunk_number += 1
+            data.write(chunk_data)
 
-        data = EMPTY.join([self.__buffer] + chunks)
-        self.__position += size
-        to_return = data[:size]
-        self.__buffer = data[size:]
-        return to_return
+        self.__position -= received - size
+
+        # Return 'size' bytes and store the rest.
+        data.seek(size)
+        self.__buffer = data.read()
+        data.seek(0)
+        return data.read(size)
 
     def readline(self, size=-1):
         """Read one line or up to `size` bytes from the file.
@@ -468,13 +501,33 @@ class GridOut(object):
 
         .. versionadded:: 1.9
         """
-        bytes = EMPTY
-        while len(bytes) != size:
-            byte = self.read(1)
-            bytes += byte
-            if byte == EMPTY or byte == NEWLN:
+        if size == 0:
+            return b('')
+
+        remainder = int(self.length) - self.__position
+        if size < 0 or size > remainder:
+            size = remainder
+
+        received = 0
+        data = StringIO()
+        while received < size:
+            chunk_data = self.readchunk()
+            pos = chunk_data.find(NEWLN, 0, size)
+            if pos != -1:
+                size = received + pos + 1
+
+            received += len(chunk_data)
+            data.write(chunk_data)
+            if pos != -1:
                 break
-        return bytes
+
+        self.__position -= received - size
+
+        # Return 'size' bytes and store the rest.
+        data.seek(size)
+        self.__buffer = data.read()
+        data.seek(0)
+        return data.read(size)
 
     def tell(self):
         """Return the current position of this file.
@@ -566,3 +619,55 @@ class GridFile(object):
     def __init__(self, *args, **kwargs):
         raise UnsupportedAPI("The GridFile class is no longer supported. "
                              "Please use GridIn or GridOut instead.")
+
+
+class GridOutCursor(Cursor):
+    """A cursor / iterator for returning GridOut objects as the result
+    of an arbitrary query against the GridFS files collection.
+    """
+    def __init__(self, collection, spec=None, skip=0, limit=0,
+                 timeout=True, sort=None, max_scan=None,
+                 read_preference=None, tag_sets=None,
+                 secondary_acceptable_latency_ms=None, compile_re=True):
+        """Create a new cursor, similar to the normal
+        :class:`~pymongo.cursor.Cursor`.
+
+        Should not be called directly by application developers - see
+        the :class:`~gridfs.GridFS` method :meth:`~gridfs.GridFS.find` instead.
+
+        .. versionadded 2.7
+
+        .. mongodoc:: cursors
+        """
+        # Hold on to the base "fs" collection to create GridOut objects later.
+        self.__root_collection = collection
+
+        # Copy these settings from collection if they are not set by caller.
+        read_preference = read_preference or collection.files.read_preference
+        tag_sets = tag_sets or collection.files.tag_sets
+        latency = (secondary_acceptable_latency_ms
+                   or collection.files.secondary_acceptable_latency_ms)
+
+        super(GridOutCursor, self).__init__(
+            collection.files, spec, skip=skip, limit=limit, timeout=timeout,
+            sort=sort, max_scan=max_scan, read_preference=read_preference,
+            secondary_acceptable_latency_ms=latency, compile_re=compile_re,
+            tag_sets=tag_sets)
+
+    def next(self):
+        """Get next GridOut object from cursor.
+        """
+        # Work around "super is not iterable" issue in Python 3.x
+        next_file = getattr(super(GridOutCursor, self), next_item)()
+        return GridOut(self.__root_collection, file_document=next_file)
+
+    def add_option(self, *args, **kwargs):
+        raise NotImplementedError("Method does not exist for GridOutCursor")
+
+    def remove_option(self, *args, **kwargs):
+        raise NotImplementedError("Method does not exist for GridOutCursor")
+
+    def _clone_base(self):
+        """Creates an empty GridOutCursor for information to be copied into.
+        """
+        return GridOutCursor(self.__root_collection)

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,10 +16,11 @@
 
 """Test the bson module."""
 
-import unittest
 import datetime
 import re
 import sys
+import traceback
+import unittest
 try:
     import uuid
     should_test_uuid = True
@@ -32,7 +33,8 @@ from nose.plugins.skip import SkipTest
 import bson
 from bson import (BSON,
                   decode_all,
-                  is_valid)
+                  is_valid,
+                  Regex)
 from bson.binary import Binary, UUIDLegacy
 from bson.code import Code
 from bson.objectid import ObjectId
@@ -40,13 +42,13 @@ from bson.dbref import DBRef
 from bson.py3compat import b
 from bson.son import SON
 from bson.timestamp import Timestamp
-from bson.errors import (InvalidDocument,
+from bson.errors import (InvalidBSON,
+                         InvalidDocument,
                          InvalidStringData)
 from bson.max_key import MaxKey
 from bson.min_key import MinKey
 from bson.tz_util import (FixedOffset,
                           utc)
-import pymongo
 
 from test import qcheck
 
@@ -54,27 +56,91 @@ PY3 = sys.version_info[0] == 3
 
 
 class TestBSON(unittest.TestCase):
-
-    def setUp(self):
-        pass
+    def assertInvalid(self, data):
+        self.assertRaises(InvalidBSON, bson.BSON(data).decode)
 
     def test_basic_validation(self):
         self.assertRaises(TypeError, is_valid, 100)
         self.assertRaises(TypeError, is_valid, u"test")
         self.assertRaises(TypeError, is_valid, 10.4)
 
-        self.assertFalse(is_valid(b("test")))
+        self.assertInvalid(b("test"))
 
         # the simplest valid BSON document
         self.assertTrue(is_valid(b("\x05\x00\x00\x00\x00")))
         self.assertTrue(is_valid(BSON(b("\x05\x00\x00\x00\x00"))))
-        self.assertFalse(is_valid(b("\x04\x00\x00\x00\x00")))
-        self.assertFalse(is_valid(b("\x05\x00\x00\x00\x01")))
-        self.assertFalse(is_valid(b("\x05\x00\x00\x00")))
-        self.assertFalse(is_valid(b("\x05\x00\x00\x00\x00\x00")))
-        self.assertFalse(is_valid(b("\x07\x00\x00\x00\x02a\x00\x78\x56\x34\x12")))
-        self.assertFalse(is_valid(b("\x09\x00\x00\x00\x10a\x00\x05\x00")))
-        self.assertFalse(is_valid(b("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")))
+
+        # failure cases
+        self.assertInvalid(b("\x04\x00\x00\x00\x00"))
+        self.assertInvalid(b("\x05\x00\x00\x00\x01"))
+        self.assertInvalid(b("\x05\x00\x00\x00"))
+        self.assertInvalid(b("\x05\x00\x00\x00\x00\x00"))
+        self.assertInvalid(b("\x07\x00\x00\x00\x02a\x00\x78\x56\x34\x12"))
+        self.assertInvalid(b("\x09\x00\x00\x00\x10a\x00\x05\x00"))
+        self.assertInvalid(b("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
+        self.assertInvalid(b("\x13\x00\x00\x00\x02foo\x00"
+                             "\x04\x00\x00\x00bar\x00\x00"))
+        self.assertInvalid(b("\x18\x00\x00\x00\x03foo\x00\x0f\x00\x00"
+                             "\x00\x10bar\x00\xff\xff\xff\x7f\x00\x00"))
+        self.assertInvalid(b("\x15\x00\x00\x00\x03foo\x00\x0c"
+                             "\x00\x00\x00\x08bar\x00\x01\x00\x00"))
+        self.assertInvalid(b("\x1c\x00\x00\x00\x03foo\x00"
+                             "\x12\x00\x00\x00\x02bar\x00"
+                             "\x05\x00\x00\x00baz\x00\x00\x00"))
+        self.assertInvalid(b("\x10\x00\x00\x00\x02a\x00"
+                             "\x04\x00\x00\x00abc\xff\x00"))
+
+    def test_bad_string_lengths(self):
+        self.assertInvalid(
+            b("\x0c\x00\x00\x00\x02\x00"
+              "\x00\x00\x00\x00\x00\x00"))
+        self.assertInvalid(
+            b("\x12\x00\x00\x00\x02\x00"
+              "\xff\xff\xff\xfffoobar\x00\x00"))
+        self.assertInvalid(
+            b("\x0c\x00\x00\x00\x0e\x00"
+              "\x00\x00\x00\x00\x00\x00"))
+        self.assertInvalid(
+            b("\x12\x00\x00\x00\x0e\x00"
+              "\xff\xff\xff\xfffoobar\x00\x00"))
+        self.assertInvalid(
+            b("\x18\x00\x00\x00\x0c\x00"
+              "\x00\x00\x00\x00\x00RY\xb5j"
+              "\xfa[\xd8A\xd6X]\x99\x00"))
+        self.assertInvalid(
+            b("\x1e\x00\x00\x00\x0c\x00"
+              "\xff\xff\xff\xfffoobar\x00"
+              "RY\xb5j\xfa[\xd8A\xd6X]\x99\x00"))
+        self.assertInvalid(
+            b("\x0c\x00\x00\x00\r\x00"
+              "\x00\x00\x00\x00\x00\x00"))
+        self.assertInvalid(
+            b("\x0c\x00\x00\x00\r\x00"
+              "\xff\xff\xff\xff\x00\x00"))
+        self.assertInvalid(
+            b("\x1c\x00\x00\x00\x0f\x00"
+              "\x15\x00\x00\x00\x00\x00"
+              "\x00\x00\x00\x0c\x00\x00"
+              "\x00\x02\x00\x01\x00\x00"
+              "\x00\x00\x00\x00"))
+        self.assertInvalid(
+            b("\x1c\x00\x00\x00\x0f\x00"
+              "\x15\x00\x00\x00\xff\xff"
+              "\xff\xff\x00\x0c\x00\x00"
+              "\x00\x02\x00\x01\x00\x00"
+              "\x00\x00\x00\x00"))
+        self.assertInvalid(
+            b("\x1c\x00\x00\x00\x0f\x00"
+              "\x15\x00\x00\x00\x01\x00"
+              "\x00\x00\x00\x0c\x00\x00"
+              "\x00\x02\x00\x00\x00\x00"
+              "\x00\x00\x00\x00"))
+        self.assertInvalid(
+            b("\x1c\x00\x00\x00\x0f\x00"
+              "\x15\x00\x00\x00\x01\x00"
+              "\x00\x00\x00\x0c\x00\x00"
+              "\x00\x02\x00\xff\xff\xff"
+              "\xff\x00\x00\x00"))
 
     def test_random_data_is_not_bson(self):
         qcheck.check_unittest(self, qcheck.isnt(is_valid),
@@ -212,6 +278,27 @@ class TestBSON(unittest.TestCase):
         qcheck.check_unittest(self, encode_then_decode,
                               qcheck.gen_mongo_dict(3))
 
+    def test_dbpointer(self):
+        # *Note* - DBPointer and DBRef are *not* the same thing. DBPointer
+        # is a deprecated BSON type. DBRef is a convention that does not
+        # exist in the BSON spec, meant to replace DBPointer. PyMongo does
+        # not support creation of the DBPointer type, but will decode
+        # DBPointer to DBRef.
+
+        bs = b("\x18\x00\x00\x00\x0c\x00\x01\x00\x00"
+               "\x00\x00RY\xb5j\xfa[\xd8A\xd6X]\x99\x00")
+
+        self.assertEqual({'': DBRef('', ObjectId('5259b56afa5bd841d6585d99'))},
+                         bson.BSON(bs).decode())
+
+    def test_bad_dbref(self):
+        ref_only = {'ref': {'$ref': 'collection'}}
+        id_only = {'ref': {'$id': ObjectId()}}
+
+        self.assertEqual(DBRef('collection', id=None),
+                         BSON.encode(ref_only).decode()['ref'])
+        self.assertEqual(id_only, BSON.encode(id_only).decode())
+
     def test_bytes_as_keys(self):
         doc = {b("foo"): 'bar'}
         # Since `bytes` are stored as Binary you can't use them
@@ -344,18 +431,26 @@ class TestBSON(unittest.TestCase):
         w = {u"aéあ": u"aéあ"}
         self.assertEqual(w, BSON.encode(w).decode())
 
-        if not PY3:
-            # In python3 this would be stored as BSON binary
-            # subtype 0 and wouldn't raise an exception.
-            y = {"hello": u"aé".encode("iso-8859-1")}
-            self.assertRaises(InvalidStringData, BSON.encode, y)
+        iso8859_bytes = u"aé".encode("iso-8859-1")
+        y = {"hello": iso8859_bytes}
+        if PY3:
+            # Stored as BSON binary subtype 0.
+            out = BSON.encode(y).decode()
+            self.assertTrue(isinstance(out['hello'], bytes))
+            self.assertEqual(out['hello'], iso8859_bytes)
+        else:
+            # Python 2.
+            try:
+                BSON.encode(y)
+            except InvalidStringData, e:
+                self.assertTrue(repr(iso8859_bytes) in str(e))
 
             # The next two tests only make sense in python 2.x since
             # you can't use `bytes` type as document keys in python 3.x.
             x = {u"aéあ".encode("utf-8"): u"aéあ".encode("utf-8")}
             self.assertEqual(w, BSON.encode(x).decode())
 
-            z = {u"aé".encode("iso-8859-1"): "hello"}
+            z = {iso8859_bytes: "hello"}
             self.assertRaises(InvalidStringData, BSON.encode, z)
 
     def test_null_character(self):
@@ -440,6 +535,153 @@ class TestBSON(unittest.TestCase):
             raise SkipTest("No OrderedDict")
         d = OrderedDict([("one", 1), ("two", 2), ("three", 3), ("four", 4)])
         self.assertEqual(d, BSON.encode(d).decode(as_class=OrderedDict))
+
+    def test_bson_regex(self):
+        # Invalid Python regex, though valid PCRE.
+        bson_re1 = Regex(r'[\w-\.]')
+        self.assertEqual(r'[\w-\.]', bson_re1.pattern)
+        self.assertEqual(0, bson_re1.flags)
+
+        doc1 = {'r': bson_re1}
+        doc1_bson = b(
+            '\x11\x00\x00\x00'              # document length
+            '\x0br\x00[\\w-\\.]\x00\x00'    # r: regex
+            '\x00')                         # document terminator
+
+        self.assertEqual(doc1_bson, BSON.encode(doc1))
+        self.assertEqual(doc1, BSON(doc1_bson).decode(compile_re=False))
+
+        # Valid Python regex, with flags.
+        re2 = re.compile('.*', re.I | re.L | re.M | re.S | re.U | re.X)
+        bson_re2 = Regex('.*', re.I | re.L | re.M | re.S | re.U | re.X)
+
+        doc2_with_re = {'r': re2}
+        doc2_with_bson_re = {'r': bson_re2}
+        doc2_bson = b(
+            "\x12\x00\x00\x00"           # document length
+            "\x0br\x00.*\x00ilmsux\x00"  # r: regex
+            "\x00")                      # document terminator
+
+        self.assertEqual(doc2_bson, BSON.encode(doc2_with_re))
+        self.assertEqual(doc2_bson, BSON.encode(doc2_with_bson_re))
+
+        # Built-in re objects don't support ==. Compare pattern and flags.
+        self.assertEqual(re2.pattern, BSON(doc2_bson).decode()['r'].pattern)
+        self.assertEqual(re2.flags, BSON(doc2_bson).decode()['r'].flags)
+
+        self.assertEqual(
+            doc2_with_bson_re, BSON(doc2_bson).decode(compile_re=False))
+
+    def test_regex_from_native(self):
+        self.assertEqual('.*', Regex.from_native(re.compile('.*')).pattern)
+        self.assertEqual(0, Regex.from_native(re.compile(b(''))).flags)
+
+        regex = re.compile(b(''), re.I | re.L | re.M | re.S | re.X)
+        self.assertEqual(
+            re.I | re.L | re.M | re.S | re.X,
+            Regex.from_native(regex).flags)
+
+        unicode_regex = re.compile('', re.U)
+        self.assertEqual(re.U, Regex.from_native(unicode_regex).flags)
+
+    def test_exception_wrapping(self):
+        # No matter what exception is raised while trying to decode BSON,
+        # the final exception always matches InvalidBSON and the original
+        # traceback is preserved.
+
+        # Invalid Python regex, though valid PCRE.
+        # Causes an error in re.compile().
+        bad_doc = BSON.encode({'r': Regex(r'[\w-\.]')})
+
+        try:
+            decode_all(bad_doc)
+        except InvalidBSON:
+            exc_type, exc_value, exc_tb = sys.exc_info()
+            # Original re error was captured and wrapped in InvalidBSON.
+            self.assertEqual(exc_value.args[0], 'bad character range')
+
+            # Traceback includes bson module's call into re module.
+            for filename, lineno, fname, text in traceback.extract_tb(exc_tb):
+                if filename.endswith('re.py') and fname == 'compile':
+                    # Traceback was correctly preserved.
+                    break
+            else:
+                self.fail('Traceback not captured')
+        else:
+            self.fail('InvalidBSON not raised')
+            
+    def test_minkey_maxkey_comparison(self):
+        # MinKey's <, <=, >, >=, !=, and ==.
+        self.assertTrue(MinKey() < None)
+        self.assertTrue(MinKey() < 1)
+        self.assertTrue(MinKey() <= 1)
+        self.assertTrue(MinKey() <= MinKey())
+        self.assertFalse(MinKey() > None)
+        self.assertFalse(MinKey() > 1)
+        self.assertFalse(MinKey() >= 1)
+        self.assertTrue(MinKey() >= MinKey())
+        self.assertTrue(MinKey() != 1)
+        self.assertFalse(MinKey() == 1)
+        self.assertTrue(MinKey() == MinKey())
+        
+        # MinKey compared to MaxKey.
+        self.assertTrue(MinKey() < MaxKey())
+        self.assertTrue(MinKey() <= MaxKey())
+        self.assertFalse(MinKey() > MaxKey())
+        self.assertFalse(MinKey() >= MaxKey())
+        self.assertTrue(MinKey() != MaxKey())
+        self.assertFalse(MinKey() == MaxKey())
+        
+        # MaxKey's <, <=, >, >=, !=, and ==.
+        self.assertFalse(MaxKey() < None)
+        self.assertFalse(MaxKey() < 1)
+        self.assertFalse(MaxKey() <= 1)
+        self.assertTrue(MaxKey() <= MaxKey())
+        self.assertTrue(MaxKey() > None)
+        self.assertTrue(MaxKey() > 1)
+        self.assertTrue(MaxKey() >= 1)
+        self.assertTrue(MaxKey() >= MaxKey())
+        self.assertTrue(MaxKey() != 1)
+        self.assertFalse(MaxKey() == 1)
+        self.assertTrue(MaxKey() == MaxKey())
+
+        # MaxKey compared to MinKey.
+        self.assertFalse(MaxKey() < MinKey())
+        self.assertFalse(MaxKey() <= MinKey())
+        self.assertTrue(MaxKey() > MinKey())
+        self.assertTrue(MaxKey() >= MinKey())
+        self.assertTrue(MaxKey() != MinKey())
+        self.assertFalse(MaxKey() == MinKey())
+
+    def test_timestamp_comparison(self):
+        # Timestamp is initialized with time, inc. Time is the more
+        # significant comparand.
+        self.assertTrue(Timestamp(1, 0) < Timestamp(2, 17))
+        self.assertTrue(Timestamp(2, 0) > Timestamp(1, 0))
+        self.assertTrue(Timestamp(1, 7) <= Timestamp(2, 0))
+        self.assertTrue(Timestamp(2, 0) >= Timestamp(1, 1))
+        self.assertTrue(Timestamp(2, 0) <= Timestamp(2, 0))
+        self.assertTrue(Timestamp(2, 0) >= Timestamp(2, 0))
+        self.assertFalse(Timestamp(1, 0) > Timestamp(2, 0))
+
+        # Comparison by inc.
+        self.assertTrue(Timestamp(1, 0) < Timestamp(1, 1))
+        self.assertTrue(Timestamp(1, 1) > Timestamp(1, 0))
+        self.assertTrue(Timestamp(1, 0) <= Timestamp(1, 0))
+        self.assertTrue(Timestamp(1, 0) <= Timestamp(1, 1))
+        self.assertFalse(Timestamp(1, 0) >= Timestamp(1, 1))
+        self.assertTrue(Timestamp(1, 0) >= Timestamp(1, 0))
+        self.assertTrue(Timestamp(1, 1) >= Timestamp(1, 0))
+        self.assertFalse(Timestamp(1, 1) <= Timestamp(1, 0))
+        self.assertTrue(Timestamp(1, 0) <= Timestamp(1, 0))
+        self.assertFalse(Timestamp(1, 0) > Timestamp(1, 0))
+
+    def test_bad_id_keys(self):
+        self.assertRaises(InvalidDocument, BSON.encode,
+                          {"_id": {"$bad": 123}}, True)
+        self.assertRaises(InvalidDocument, BSON.encode,
+                          {"_id": {'$oid': "52d0b971b3ba219fdeb4170e"}}, True)
+        BSON.encode({"_id": {'$oid': "52d0b971b3ba219fdeb4170e"}})
 
 if __name__ == "__main__":
     unittest.main()

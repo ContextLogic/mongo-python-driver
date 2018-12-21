@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,14 +16,19 @@
 
 import warnings
 
-from bson.binary import ALL_UUID_SUBTYPES, OLD_UUID_SUBTYPE
 from bson.code import Code
+from bson.objectid import ObjectId
 from bson.son import SON
-from pymongo import (common,
+from pymongo import (bulk,
+                     common,
                      helpers,
                      message)
+from pymongo.command_cursor import CommandCursor
 from pymongo.cursor import Cursor
-from pymongo.errors import ConfigurationError, InvalidName
+from pymongo.errors import InvalidName, OperationFailure
+from pymongo.helpers import _check_write_command_response
+from pymongo.message import _INSERT, _UPDATE, _DELETE
+from pymongo.read_preferences import ReadPreference
 
 
 try:
@@ -88,6 +93,7 @@ class Collection(common.BaseObject):
             secondary_acceptable_latency_ms=(
                 database.secondary_acceptable_latency_ms),
             safe=database.safe,
+            uuidrepresentation=database.uuid_subtype,
             **database.write_concern)
 
         if not isinstance(name, basestring):
@@ -109,7 +115,6 @@ class Collection(common.BaseObject):
 
         self.__database = database
         self.__name = unicode(name)
-        self.__uuid_subtype = OLD_UUID_SUBTYPE
         self.__full_name = u"%s.%s" % (self.__database.name, self.__name)
         if create or kwargs:
             self.__create(kwargs)
@@ -118,14 +123,15 @@ class Collection(common.BaseObject):
         """Sends a create command with the given options.
         """
 
-        # Send size as a float, not an int/long. BSON can only handle 32-bit
-        # ints which conflicts w/ max collection size of 10000000000.
         if options:
             if "size" in options:
                 options["size"] = float(options["size"])
-            self.__database.command("create", self.__name, **options)
+            self.__database.command("create", self.__name,
+                                    read_preference=ReadPreference.PRIMARY,
+                                    **options)
         else:
-            self.__database.command("create", self.__name)
+            self.__database.command("create", self.__name,
+                                    read_preference=ReadPreference.PRIMARY)
 
     def __getattr__(self, name):
         """Get a sub-collection of this collection by name.
@@ -183,23 +189,34 @@ class Collection(common.BaseObject):
         """
         return self.__database
 
-    def __get_uuid_subtype(self):
-        return self.__uuid_subtype
+    def initialize_unordered_bulk_op(self):
+        """Initialize an unordered batch of write operations.
 
-    def __set_uuid_subtype(self, subtype):
-        if subtype not in ALL_UUID_SUBTYPES:
-            raise ConfigurationError("Not a valid setting for uuid_subtype.")
-        self.__uuid_subtype = subtype
+        Operations will be performed on the server in arbitrary order,
+        possibly in parallel. All operations will be attempted.
 
-    uuid_subtype = property(__get_uuid_subtype, __set_uuid_subtype,
-                            doc="""This attribute specifies which BSON Binary
-                            subtype is used when storing UUIDs. Historically
-                            UUIDs have been stored as BSON Binary subtype 3.
-                            This attribute is used to switch to the newer BSON
-                            binary subtype 4. It can also be used to force
-                            legacy byte order and subtype compatibility with
-                            the Java and C# drivers. See the
-                            :mod:`bson.binary` module for all options.""")
+        Returns a :class:`~pymongo.bulk.BulkOperationBuilder` instance.
+
+        See :ref:`unordered_bulk` for examples.
+
+        .. versionadded:: 2.7
+        """
+        return bulk.BulkOperationBuilder(self, ordered=False)
+
+    def initialize_ordered_bulk_op(self):
+        """Initialize an ordered batch of write operations.
+
+        Operations will be performed on the server serially, in the
+        order provided. If an error occurs all remaining operations
+        are aborted.
+
+        Returns a :class:`~pymongo.bulk.BulkOperationBuilder` instance.
+
+        See :ref:`ordered_bulk` for examples.
+
+        .. versionadded:: 2.7
+        """
+        return bulk.BulkOperationBuilder(self, ordered=True)
 
     def save(self, to_save, manipulate=True,
              safe=None, check_keys=True, **kwargs):
@@ -224,7 +241,7 @@ class Collection(common.BaseObject):
 
         By default an acknowledgment is requested from the server that the
         save was successful, raising :class:`~pymongo.errors.OperationFailure`
-        if an error occurred. **Passing ``w=0`` disables write acknowledgement
+        if an error occurred. **Passing w=0 disables write acknowledgement
         and all other write concern options.**
 
         :Parameters:
@@ -292,7 +309,7 @@ class Collection(common.BaseObject):
 
         By default an acknowledgment is requested from the server that the
         insert was successful, raising :class:`~pymongo.errors.OperationFailure`
-        if an error occurred. **Passing ``w=0`` disables write acknowledgement
+        if an error occurred. **Passing w=0 disables write acknowledgement
         and all other write concern options.**
 
         :Parameters:
@@ -339,27 +356,68 @@ class Collection(common.BaseObject):
            Support for passing `getLastError` options as keyword
            arguments.
         .. versionchanged:: 1.1
-           Bulk insert works with any iterable
+           Bulk insert works with an iterable sequence of documents.
 
         .. mongodoc:: insert
         """
+        client = self.database.connection
+        # Batch inserts require us to know the connected primary's
+        # max_bson_size, max_message_size, and max_write_batch_size.
+        # We have to be connected to the primary to know that.
+        client._ensure_connected(True)
+
         docs = doc_or_docs
         return_one = False
         if isinstance(docs, dict):
             return_one = True
             docs = [docs]
 
+        ids = []
+
         if manipulate:
-            docs = [self.__database._fix_incoming(doc, self) for doc in docs]
+            def gen():
+                db = self.__database
+                for doc in docs:
+                    # Apply user-configured SON manipulators. This order of
+                    # operations is required for backwards compatibility,
+                    # see PYTHON-709.
+                    doc = db._apply_incoming_manipulators(doc, self)
+                    if '_id' not in doc:
+                        doc['_id'] = ObjectId()
+
+                    doc = db._apply_incoming_copying_manipulators(doc, self)
+                    ids.append(doc['_id'])
+                    yield doc
+        else:
+            def gen():
+                for doc in docs:
+                    ids.append(doc.get('_id'))
+                    yield doc
 
         safe, options = self._get_write_mode(safe, **kwargs)
-        self.__database.connection._send_message(
-            message.insert(self.__full_name, docs,
-                           check_keys, safe, options,
-                           continue_on_error, self.__uuid_subtype), safe)
 
-        ids = [doc.get("_id", None) for doc in docs]
-        return return_one and ids[0] or ids
+        if client.max_wire_version > 1 and safe:
+            # Insert command
+            command = SON([('insert', self.name),
+                           ('ordered', not continue_on_error)])
+
+            if options:
+                command['writeConcern'] = options
+
+            results = message._do_batched_write_command(
+                    self.database.name + ".$cmd", _INSERT, command,
+                    gen(), check_keys, self.uuid_subtype, client)
+            _check_write_command_response(results)
+        else:
+            # Legacy batched OP_INSERT
+            message._do_batched_insert(self.__full_name, gen(), check_keys,
+                                       safe, options, continue_on_error,
+                                       self.uuid_subtype, client)
+
+        if return_one:
+            return ids[0]
+        else:
+            return ids
 
     def update(self, spec, document, upsert=False, manipulate=False,
                safe=None, multi=False, check_keys=True, **kwargs):
@@ -376,7 +434,7 @@ class Collection(common.BaseObject):
 
         By default an acknowledgment is requested from the server that the
         update was successful, raising :class:`~pymongo.errors.OperationFailure`
-        if an error occurred. **Passing ``w=0`` disables write acknowledgement
+        if an error occurred. **Passing w=0 disables write acknowledgement
         and all other write concern options.**
 
         There are many useful `update modifiers`_ which can be used
@@ -460,6 +518,10 @@ class Collection(common.BaseObject):
         if not isinstance(upsert, bool):
             raise TypeError("upsert must be an instance of bool")
 
+        client = self.database.connection
+        # Need to connect to know the wire version, and may want to connect
+        # before applying SON manipulators.
+        client._ensure_connected(True)
         if manipulate:
             document = self.__database._fix_incoming(document, self)
 
@@ -471,14 +533,43 @@ class Collection(common.BaseObject):
             # we check here. Passing a document with a mix of top level keys
             # starting with and without a '$' is invalid and the server will
             # raise an appropriate exception.
-            first = document.iterkeys().next()
+            first = (document.iterkeys()).next()
             if first.startswith('$'):
                 check_keys = False
 
-        return self.__database.connection._send_message(
-            message.update(self.__full_name, upsert, multi,
-                           spec, document, safe, options,
-                           check_keys, self.__uuid_subtype), safe)
+        if client.max_wire_version > 1 and safe:
+            # Update command
+            command = SON([('update', self.name)])
+            if options:
+                command['writeConcern'] = options
+
+            docs = [SON([('q', spec), ('u', document),
+                         ('multi', multi), ('upsert', upsert)])]
+
+            results = message._do_batched_write_command(
+                self.database.name + '.$cmd', _UPDATE, command,
+                docs, check_keys, self.uuid_subtype, client)
+            _check_write_command_response(results)
+
+            _, result = results[0]
+            # Add the updatedExisting field for compatibility
+            if result.get('n') and 'upserted' not in result:
+                result['updatedExisting'] = True
+            else:
+                result['updatedExisting'] = False
+                # MongoDB >= 2.6.0 returns the upsert _id in an array
+                # element. Break it out for backward compatibility.
+                if isinstance(result.get('upserted'), list):
+                    result['upserted'] = result['upserted'][0]['_id']
+
+            return result
+
+        else:
+            # Legacy OP_UPDATE
+            return client._send_message(
+                message.update(self.__full_name, upsert, multi,
+                               spec, document, safe, options,
+                               check_keys, self.uuid_subtype), safe)
 
     def drop(self):
         """Alias for :meth:`~pymongo.database.Database.drop_collection`.
@@ -492,7 +583,7 @@ class Collection(common.BaseObject):
         """
         self.__database.drop_collection(self.__name)
 
-    def remove(self, spec_or_id=None, safe=None, **kwargs):
+    def remove(self, spec_or_id=None, safe=None, multi=True, **kwargs):
         """Remove a document(s) from this collection.
 
         .. warning:: Calls to :meth:`remove` should be performed with
@@ -510,7 +601,7 @@ class Collection(common.BaseObject):
 
         By default an acknowledgment is requested from the server that the
         remove was successful, raising :class:`~pymongo.errors.OperationFailure`
-        if an error occurred. **Passing ``w=0`` disables write acknowledgement
+        if an error occurred. **Passing w=0 disables write acknowledgement
         and all other write concern options.**
 
         :Parameters:
@@ -518,6 +609,9 @@ class Collection(common.BaseObject):
             documents to be removed OR any other type specifying the
             value of ``"_id"`` for the document to be removed
           - `safe` (optional): **DEPRECATED** - Use `w` instead.
+          - `multi` (optional): If ``True`` (the default) remove all documents
+            matching `spec_or_id`, otherwise remove only the first matching
+            document.
           - `w` (optional): (integer or string) If this is a replica set, write
             operations will block until they have been replicated to the
             specified number or tagged set of servers. `w=<int>` always includes
@@ -560,9 +654,32 @@ class Collection(common.BaseObject):
             spec_or_id = {"_id": spec_or_id}
 
         safe, options = self._get_write_mode(safe, **kwargs)
-        return self.__database.connection._send_message(
-            message.delete(self.__full_name, spec_or_id, safe,
-                           options, self.__uuid_subtype), safe)
+
+        client = self.database.connection
+
+        # Need to connect to know the wire version.
+        client._ensure_connected(True)
+        if client.max_wire_version > 1 and safe:
+            # Delete command
+            command = SON([('delete', self.name)])
+            if options:
+                command['writeConcern'] = options
+
+            docs = [SON([('q', spec_or_id), ('limit', int(not multi))])]
+
+            results = message._do_batched_write_command(
+                self.database.name + '.$cmd', _DELETE, command,
+                docs, False, self.uuid_subtype, client)
+            _check_write_command_response(results)
+
+            _, result = results[0]
+            return result
+
+        else:
+            # Legacy OP_DELETE
+            return client._send_message(
+                message.delete(self.__full_name, spec_or_id, safe,
+                               options, self.uuid_subtype, int(not multi)), safe)
 
     def find_one(self, spec_or_id=None, *args, **kwargs):
         """Get a single document from the database.
@@ -584,6 +701,11 @@ class Collection(common.BaseObject):
           - `**kwargs` (optional): any additional keyword arguments
             are the same as the arguments to :meth:`find`.
 
+          - `max_time_ms` (optional): a value for max_time_ms may be
+            specified as part of `**kwargs`, e.g.
+
+              >>> find_one(max_time_ms=100)
+
         .. versionchanged:: 1.7
            Allow passing any of the arguments that are valid for
            :meth:`find`.
@@ -595,7 +717,11 @@ class Collection(common.BaseObject):
         if spec_or_id is not None and not isinstance(spec_or_id, dict):
             spec_or_id = {"_id": spec_or_id}
 
-        for result in self.find(spec_or_id, *args, **kwargs).limit(-1):
+        max_time_ms = kwargs.pop("max_time_ms", None)
+        cursor = self.find(spec_or_id,
+                           *args, **kwargs).max_time_ms(max_time_ms)
+
+        for result in cursor.limit(-1):
             return result
         return None
 
@@ -631,11 +757,11 @@ class Collection(common.BaseObject):
             the start of the result set) when returning the results
           - `limit` (optional): the maximum number of results to
             return
-          - `timeout` (optional): if True, any returned cursor will be
-            subject to the normal timeout behavior of the mongod
-            process. Otherwise, the returned cursor will never timeout
-            at the server. Care should be taken to ensure that cursors
-            with timeout turned off are properly closed.
+          - `timeout` (optional): if True (the default), any returned
+            cursor is closed by the server after 10 minutes of
+            inactivity. If set to False, the returned cursor will never
+            time out on the server. Care should be taken to ensure that
+            cursors with timeout turned off are properly closed.
           - `snapshot` (optional): if True, snapshot mode will be used
             for this query. Snapshot mode assures no duplicates are
             returned, or objects missed, which were present at both
@@ -657,7 +783,7 @@ class Collection(common.BaseObject):
             examined when performing the query
           - `as_class` (optional): class to use for documents in the
             query result (default is
-            :attr:`~pymongo.connection.Connection.document_class`)
+            :attr:`~pymongo.mongo_client.MongoClient.document_class`)
           - `slave_okay` (optional): if True, allows this query to
             be run against a replica secondary.
           - `await_data` (optional): if True, the server will block for
@@ -669,19 +795,53 @@ class Collection(common.BaseObject):
             outgoing SON manipulators before returning.
           - `network_timeout` (optional): specify a timeout to use for
             this query, which will override the
-            :class:`~pymongo.connection.Connection`-level default
+            :class:`~pymongo.mongo_client.MongoClient`-level default
           - `read_preference` (optional): The read preference for
             this query.
           - `tag_sets` (optional): The tag sets for this query.
           - `secondary_acceptable_latency_ms` (optional): Any replica-set
             member whose ping time is within secondary_acceptable_latency_ms of
             the nearest member may accept reads. Default 15 milliseconds.
+            **Ignored by mongos** and must be configured on the command line.
+            See the localThreshold_ option for more information.
+          - `compile_re` (optional): if ``False``, don't attempt to compile
+            BSON regex objects into Python regexes. Return instances of
+            :class:`~bson.regex.Regex` instead.
+          - `exhaust` (optional): If ``True`` create an "exhaust" cursor.
+            MongoDB will stream batched results to the client without waiting
+            for the client to request each batch, reducing latency.
 
-        .. note:: The `manipulate` parameter may default to False in
-           a future release.
+        .. note:: There are a number of caveats to using the `exhaust`
+           parameter:
+
+            1. The `exhaust` and `limit` options are incompatible and can
+            not be used together.
+
+            2. The `exhaust` option is not supported by mongos and can not be
+            used with a sharded cluster.
+
+            3. A :class:`~pymongo.cursor.Cursor` instance created with the
+            `exhaust` option requires an exclusive :class:`~socket.socket`
+            connection to MongoDB. If the :class:`~pymongo.cursor.Cursor` is
+            discarded without being completely iterated the underlying
+            :class:`~socket.socket` connection will be closed and discarded
+            without being returned to the connection pool.
+
+            4. A :class:`~pymongo.cursor.Cursor` instance created with the
+            `exhaust` option in a :doc:`request </examples/requests>` **must**
+            be completely iterated before executing any other operation.
+
+            5. The `network_timeout` option is ignored when using the
+            `exhaust` option.
+
+        .. note:: The `manipulate` and `compile_re` parameters may default to
+           False in future releases.
 
         .. note:: The `max_scan` parameter requires server
            version **>= 1.5.1**
+
+        .. versionadded:: 2.7
+           The ``compile_re`` parameter.
 
         .. versionadded:: 2.3
            The `tag_sets` and `secondary_acceptable_latency_ms` parameters.
@@ -703,6 +863,7 @@ class Collection(common.BaseObject):
            The `tailable` parameter.
 
         .. mongodoc:: find
+        .. _localThreshold: http://docs.mongodb.org/manual/reference/mongos/#cmdoption-mongos--localThreshold
         """
         if not 'slave_okay' in kwargs:
             kwargs['slave_okay'] = self.slave_okay
@@ -714,6 +875,70 @@ class Collection(common.BaseObject):
             kwargs['secondary_acceptable_latency_ms'] = (
                 self.secondary_acceptable_latency_ms)
         return Cursor(self, *args, **kwargs)
+
+    def parallel_scan(self, num_cursors, **kwargs):
+        """Scan this entire collection in parallel.
+
+        Returns a list of up to ``num_cursors`` cursors that can be iterated
+        concurrently. As long as the collection is not modified during
+        scanning, each document appears once in one of the cursors' result
+        sets.
+
+        For example, to process each document in a collection using some
+        thread-safe ``process_document()`` function::
+
+            def process_cursor(cursor):
+                for document in cursor:
+                    # Some thread-safe processing function:
+                    process_document(document)
+
+            # Get up to 4 cursors.
+            cursors = collection.parallel_scan(4)
+            threads = [
+                threading.Thread(target=process_cursor, args=(cursor,))
+                for cursor in cursors]
+
+            for thread in threads:
+                thread.start()
+
+            for thread in threads:
+                thread.join()
+
+            # All documents have now been processed.
+
+        With :class:`~pymongo.mongo_replica_set_client.MongoReplicaSetClient`
+        or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
+        if the `read_preference` attribute of this instance is not set to
+        :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or the
+        (deprecated) `slave_okay` attribute of this instance is set to `True`
+        the command will be sent to a secondary or slave.
+
+        :Parameters:
+          - `num_cursors`: the number of cursors to return
+
+        .. note:: Requires server version **>= 2.5.5**.
+
+        """
+        use_master = not self.slave_okay and not self.read_preference
+        compile_re = kwargs.get('compile_re', False)
+
+        command_kwargs = {
+            'numCursors': num_cursors,
+            'read_preference': self.read_preference,
+            'tag_sets': self.tag_sets,
+            'secondary_acceptable_latency_ms': (
+                self.secondary_acceptable_latency_ms),
+            'slave_okay': self.slave_okay,
+            '_use_master': use_master}
+        command_kwargs.update(kwargs)
+
+        result, conn_id = self.__database._command(
+            "parallelCollectionScan", self.__name, **command_kwargs)
+
+        return [CommandCursor(self,
+                              cursor['cursor'],
+                              conn_id,
+                              compile_re) for cursor in result['cursors']]
 
     def count(self):
         """Get the number of documents in this collection.
@@ -728,32 +953,43 @@ class Collection(common.BaseObject):
 
         Takes either a single key or a list of (key, direction) pairs.
         The key(s) must be an instance of :class:`basestring`
-        (:class:`str` in python 3), and the directions must be one of
+        (:class:`str` in python 3), and the direction(s) should be one of
         (:data:`~pymongo.ASCENDING`, :data:`~pymongo.DESCENDING`,
-        :data:`~pymongo.GEO2D`). Returns the name of the created index.
+        :data:`~pymongo.GEO2D`, :data:`~pymongo.GEOHAYSTACK`,
+        :data:`~pymongo.GEOSPHERE`, :data:`~pymongo.HASHED`,
+        :data:`~pymongo.TEXT`).
 
-        To create a single key index on the key ``'mike'`` we just use
-        a string argument:
+        To create a simple ascending index on the key ``'mike'`` we just
+        use a string argument::
 
-        >>> my_collection.create_index("mike")
+          >>> my_collection.create_index("mike")
 
         For a compound index on ``'mike'`` descending and ``'eliot'``
-        ascending we need to use a list of tuples:
+        ascending we need to use a list of tuples::
 
-        >>> my_collection.create_index([("mike", pymongo.DESCENDING),
-        ...                             ("eliot", pymongo.ASCENDING)])
+          >>> my_collection.create_index([("mike", pymongo.DESCENDING),
+          ...                             ("eliot", pymongo.ASCENDING)])
 
-        All optional index creation paramaters should be passed as
-        keyword arguments to this method. Valid options include:
+        All optional index creation parameters should be passed as
+        keyword arguments to this method. For example::
+
+          >>> my_collection.create_index([("mike", pymongo.DESCENDING)],
+          ...                            background=True)
+
+        Valid options include:
 
           - `name`: custom name to use for this index - if none is
             given, a name will be generated
-          - `unique`: should this index guarantee uniqueness?
-          - `dropDups` or `drop_dups`: should we drop duplicates
-          - `background`: if this index should be created in the
+          - `unique`: if ``True`` creates a unique constraint on the index
+          - `dropDups` or `drop_dups`: if ``True`` duplicate values are dropped
+            during index creation when creating a unique index
+          - `background`: if ``True`` this index should be created in the
             background
-          - `bucketSize` or `bucket_size`: size of buckets for geoHaystack
-            indexes during index creation when creating a unique index?
+          - `sparse`: if ``True``, omit from the index any documents that lack
+            the indexed field
+          - `bucketSize` or `bucket_size`: for use with geoHaystack indexes.
+            Number of documents to group together within a certain proximity
+            to a given longitude and latitude.
           - `min`: minimum value for keys in a :data:`~pymongo.GEO2D`
             index
           - `max`: maximum value for keys in a :data:`~pymongo.GEO2D`
@@ -798,15 +1034,17 @@ class Collection(common.BaseObject):
         if 'ttl' in kwargs:
             cache_for = kwargs.pop('ttl')
             warnings.warn("ttl is deprecated. Please use cache_for instead.",
-                          DeprecationWarning)
+                          DeprecationWarning, stacklevel=2)
+
+        # The types supported by datetime.timedelta. 2to3 removes long.
+        if not isinstance(cache_for, (int, long, float)):
+            raise TypeError("cache_for must be an integer or float.")
 
         keys = helpers._index_list(key_or_list)
         index_doc = helpers._index_document(keys)
 
-        index = {"key": index_doc, "ns": self.__full_name}
-
         name = "name" in kwargs and kwargs["name"] or _gen_index_name(keys)
-        index["name"] = name
+        index = {"key": index_doc, "name": name}
 
         if "drop_dups" in kwargs:
             kwargs["dropDups"] = kwargs.pop("drop_dups")
@@ -816,9 +1054,18 @@ class Collection(common.BaseObject):
 
         index.update(kwargs)
 
-        self.__database.system.indexes.insert(index, manipulate=False,
-                                              check_keys=False,
-                                              **self._get_wc_override())
+        try:
+            self.__database.command('createIndexes', self.name,
+                                    read_preference=ReadPreference.PRIMARY,
+                                    indexes=[index])
+        except OperationFailure, exc:
+            if exc.code in common.COMMAND_NOT_FOUND_CODES:
+                index["ns"] = self.__full_name
+                self.__database.system.indexes.insert(index, manipulate=False,
+                                                      check_keys=False,
+                                                      **self._get_wc_override())
+            else:
+                raise
 
         self.__database.connection._cache_index(self.__database.name,
                                                 self.__name, name, cache_for)
@@ -830,10 +1077,13 @@ class Collection(common.BaseObject):
 
         Takes either a single key or a list of (key, direction) pairs.
         The key(s) must be an instance of :class:`basestring`
-        (:class:`str` in python 3), and the direction(s) must be one of
+        (:class:`str` in python 3), and the direction(s) should be one of
         (:data:`~pymongo.ASCENDING`, :data:`~pymongo.DESCENDING`,
-        :data:`~pymongo.GEO2D`). See :meth:`create_index` for a detailed
-        example.
+        :data:`~pymongo.GEO2D`, :data:`~pymongo.GEOHAYSTACK`,
+        :data:`~pymongo.GEOSPHERE`, :data:`~pymongo.HASHED`,
+        :data:`pymongo.TEXT`).
+
+        See :meth:`create_index` for detailed examples.
 
         Unlike :meth:`create_index`, which attempts to create an index
         unconditionally, :meth:`ensure_index` takes advantage of some
@@ -845,26 +1095,30 @@ class Collection(common.BaseObject):
         actually create the index.
 
         Care must be taken when the database is being accessed through
-        multiple connections at once. If an index is created using
-        PyMongo and then deleted using another connection any call to
+        multiple clients at once. If an index is created using
+        this client and deleted using another, any call to
         :meth:`ensure_index` within the cache window will fail to
         re-create the missing index.
 
-        Returns the name of the created index if an index is actually
-        created. Returns ``None`` if the index already exists.
+        Returns the specified or generated index name used if
+        :meth:`ensure_index` attempts to create the index. Returns
+        ``None`` if the index is already cached.
 
-        All optional index creation paramaters should be passed as
+        All optional index creation parameters should be passed as
         keyword arguments to this method. Valid options include:
 
           - `name`: custom name to use for this index - if none is
             given, a name will be generated
-          - `unique`: should this index guarantee uniqueness?
-          - `dropDups` or `drop_dups`: should we drop duplicates
-            during index creation when creating a unique index?
-          - `background`: if this index should be created in the
+          - `unique`: if ``True`` creates a unique constraint on the index
+          - `dropDups` or `drop_dups`: if ``True`` duplicate values are dropped
+            during index creation when creating a unique index
+          - `background`: if ``True`` this index should be created in the
             background
-          - `bucketSize` or `bucket_size`: size of buckets for geoHaystack
-            indexes during index creation when creating a unique index?
+          - `sparse`: if ``True``, omit from the index any documents that lack
+            the indexed field
+          - `bucketSize` or `bucket_size`: for use with geoHaystack indexes.
+            Number of documents to group together within a certain proximity
+            to a given longitude and latitude.
           - `min`: minimum value for keys in a :data:`~pymongo.GEO2D`
             index
           - `max`: maximum value for keys in a :data:`~pymongo.GEO2D`
@@ -927,7 +1181,8 @@ class Collection(common.BaseObject):
         """Drops the specified index on this collection.
 
         Can be used on non-existant collections or collections with no
-        indexes.  Raises OperationFailure on an error. `index_or_name`
+        indexes.  Raises OperationFailure on an error (e.g. trying to
+        drop an index that does not exist). `index_or_name`
         can be either an index name (as returned by `create_index`),
         or an index specifier (as passed to `create_index`). An index
         specifier should be a list of (key, direction) pairs. Raises
@@ -951,7 +1206,9 @@ class Collection(common.BaseObject):
 
         self.__database.connection._purge_index(self.__database.name,
                                                 self.__name, name)
-        self.__database.command("dropIndexes", self.__name, index=name,
+        self.__database.command("dropIndexes", self.__name,
+                                read_preference=ReadPreference.PRIMARY,
+                                index=name,
                                 allowable_errors=["ns not found"])
 
     def reindex(self):
@@ -963,7 +1220,8 @@ class Collection(common.BaseObject):
 
         .. versionadded:: 1.11+
         """
-        return self.__database.command("reIndex", self.__name)
+        return self.__database.command("reIndex", self.__name,
+                                       read_preference=ReadPreference.PRIMARY)
 
     def index_information(self):
         """Get information on this collection's indexes.
@@ -1019,11 +1277,11 @@ class Collection(common.BaseObject):
 
         return options
 
-    def aggregate(self, pipeline):
+    def aggregate(self, pipeline, **kwargs):
         """Perform an aggregation using the aggregation framework on this
         collection.
 
-        With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
+        With :class:`~pymongo.mongo_replica_set_client.MongoReplicaSetClient`
         or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
         if the `read_preference` attribute of this instance is not set to
         :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or the
@@ -1032,9 +1290,25 @@ class Collection(common.BaseObject):
 
         :Parameters:
           - `pipeline`: a single command or list of aggregation commands
+          - `**kwargs`: send arbitrary parameters to the aggregate command
 
-        .. note:: Requires server version **>= 2.1.0**
+        .. note:: Requires server version **>= 2.1.0**.
 
+        With server version **>= 2.5.1**, pass
+        ``cursor={}`` to retrieve unlimited aggregation results
+        with a :class:`~pymongo.command_cursor.CommandCursor`::
+
+            pipeline = [{'$project': {'name': {'$toUpper': '$name'}}}]
+            cursor = collection.aggregate(pipeline, cursor={})
+            for doc in cursor:
+                print doc
+
+        .. versionchanged:: 2.7
+           When the cursor option is used, return
+           :class:`~pymongo.command_cursor.CommandCursor` instead of
+           :class:`~pymongo.cursor.Cursor`.
+        .. versionchanged:: 2.6
+           Added cursor support.
         .. versionadded:: 2.3
 
         .. _aggregate command:
@@ -1048,18 +1322,31 @@ class Collection(common.BaseObject):
 
         use_master = not self.slave_okay and not self.read_preference
 
-        return self.__database.command("aggregate", self.__name,
-                                        pipeline=pipeline,
-                                        read_preference=self.read_preference,
-                                        tag_sets=self.tag_sets,
-                                        secondary_acceptable_latency_ms=(
-                                         self.secondary_acceptable_latency_ms),
-                                        slave_okay=self.slave_okay,
-                                        _use_master=use_master)
+        command_kwargs = {
+            'pipeline': pipeline,
+            'read_preference': self.read_preference,
+            'tag_sets': self.tag_sets,
+            'secondary_acceptable_latency_ms': (
+                self.secondary_acceptable_latency_ms),
+            'slave_okay': self.slave_okay,
+            '_use_master': use_master}
+
+        command_kwargs.update(kwargs)
+        result, conn_id = self.__database._command(
+            "aggregate", self.__name, **command_kwargs)
+
+        if 'cursor' in result:
+            return CommandCursor(
+                self,
+                result['cursor'],
+                conn_id,
+                command_kwargs.get('compile_re', True))
+        else:
+            return result
 
     # TODO key and condition ought to be optional, but deprecation
     # could be painful as argument order would have to change.
-    def group(self, key, condition, initial, reduce, finalize=None):
+    def group(self, key, condition, initial, reduce, finalize=None, **kwargs):
         """Perform a query similar to an SQL *group by* operation.
 
         Returns an array of grouped items.
@@ -1074,7 +1361,7 @@ class Collection(common.BaseObject):
             function to be applied to each document, returning the key
             to group by.
 
-        With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
+        With :class:`~pymongo.mongo_replica_set_client.MongoReplicaSetClient`
         or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
         if the `read_preference` attribute of this instance is not set to
         :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or
@@ -1116,13 +1403,14 @@ class Collection(common.BaseObject):
         use_master = not self.slave_okay and not self.read_preference
 
         return self.__database.command("group", group,
-                                       uuid_subtype=self.__uuid_subtype,
+                                       uuid_subtype=self.uuid_subtype,
                                        read_preference=self.read_preference,
                                        tag_sets=self.tag_sets,
                                        secondary_acceptable_latency_ms=(
                                            self.secondary_acceptable_latency_ms),
                                        slave_okay=self.slave_okay,
-                                       _use_master=use_master)["retval"]
+                                       _use_master=use_master,
+                                       **kwargs)["retval"]
 
     def rename(self, new_name, **kwargs):
         """Rename this collection.
@@ -1154,9 +1442,10 @@ class Collection(common.BaseObject):
             raise InvalidName("collection names must not contain '$'")
 
         new_name = "%s.%s" % (self.__database.name, new_name)
-        self.__database.connection.admin.command("renameCollection",
-                                                 self.__full_name,
-                                                 to=new_name, **kwargs)
+        client = self.__database.connection
+        client.admin.command("renameCollection", self.__full_name,
+                             read_preference=ReadPreference.PRIMARY,
+                             to=new_name, **kwargs)
 
     def distinct(self, key):
         """Get a list of distinct values for `key` among all documents
@@ -1227,7 +1516,7 @@ class Collection(common.BaseObject):
             must_use_master = True
 
         response = self.__database.command("mapreduce", self.__name,
-                                           uuid_subtype=self.__uuid_subtype,
+                                           uuid_subtype=self.uuid_subtype,
                                            map=map, reduce=reduce,
                                            read_preference=self.read_preference,
                                            tag_sets=self.tag_sets,
@@ -1256,7 +1545,7 @@ class Collection(common.BaseObject):
         result documents in a list. Otherwise, returns the full
         response from the server to the `map reduce command`_.
 
-        With :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
+        With :class:`~pymongo.mongo_replica_set_client.MongoReplicaSetClient`
         or :class:`~pymongo.master_slave_connection.MasterSlaveConnection`,
         if the `read_preference` attribute of this instance is not set to
         :attr:`pymongo.read_preferences.ReadPreference.PRIMARY` or
@@ -1283,7 +1572,7 @@ class Collection(common.BaseObject):
         use_master = not self.slave_okay and not self.read_preference
 
         res = self.__database.command("mapreduce", self.__name,
-                                      uuid_subtype=self.__uuid_subtype,
+                                      uuid_subtype=self.uuid_subtype,
                                       read_preference=self.read_preference,
                                       tag_sets=self.tag_sets,
                                       secondary_acceptable_latency_ms=(
@@ -1299,7 +1588,7 @@ class Collection(common.BaseObject):
             return res.get("results")
 
     def find_and_modify(self, query={}, update=None,
-                        upsert=False, sort=None, **kwargs):
+                        upsert=False, sort=None, full_response=False, **kwargs):
         """Update and return an object.
 
         This is a thin wrapper around the findAndModify_ command. The
@@ -1312,6 +1601,12 @@ class Collection(common.BaseObject):
         parameter. If no objects match the `query` and `upsert` is false,
         returns ``None``. If upserting and `new` is false, returns ``{}``.
 
+        If the full_response parameter is ``True``, the return value will be
+        the entire response object from the server, including the 'ok' and
+        'lastErrorObject' fields, rather than just the modified object.
+        This is useful mainly because the 'lastErrorObject' document holds 
+        information about the command's execution.
+
         :Parameters:
             - `query`: filter for the update (default ``{}``)
             - `update`: see second argument to :meth:`update` (no default)
@@ -1319,6 +1614,8 @@ class Collection(common.BaseObject):
             - `sort`: a list of (key, direction) pairs specifying the sort
               order for this query. See :meth:`~pymongo.cursor.Cursor.sort`
               for details.
+            - `full_response`: return the entire response object from the
+              server (default ``False``)
             - `remove`: remove rather than updating (default ``False``)
             - `new`: return updated rather than original object
               (default ``False``)
@@ -1332,6 +1629,9 @@ class Collection(common.BaseObject):
         .. _findAndModify: http://dochub.mongodb.org/core/findAndModify
 
         .. note:: Requires server version **>= 1.3.0**
+
+        .. versionchanged:: 2.5
+           Added the optional full_response parameter
 
         .. versionchanged:: 2.4
            Deprecated the use of mapping types for the sort parameter
@@ -1361,7 +1661,7 @@ class Collection(common.BaseObject):
                   isinstance(sort, dict) and len(sort) == 1):
                 warnings.warn("Passing mapping types for `sort` is deprecated,"
                               " use a list of (key, direction) pairs instead",
-                              DeprecationWarning)
+                              DeprecationWarning, stacklevel=2)
                 kwargs['sort'] = sort
             else:
                 raise TypeError("sort must be a list of (key, direction) "
@@ -1372,7 +1672,8 @@ class Collection(common.BaseObject):
 
         out = self.__database.command("findAndModify", self.__name,
                                       allowable_errors=[no_obj_error],
-                                      uuid_subtype=self.__uuid_subtype,
+                                      read_preference=ReadPreference.PRIMARY,
+                                      uuid_subtype=self.uuid_subtype,
                                       **kwargs)
 
         if not out['ok']:
@@ -1382,7 +1683,10 @@ class Collection(common.BaseObject):
                 # Should never get here b/c of allowable_errors
                 raise ValueError("Unexpected Error: %s" % (out,))
 
-        return out.get('value')
+        if full_response:
+            return out
+        else:
+            return out.get('value')
 
     def __iter__(self):
         return self

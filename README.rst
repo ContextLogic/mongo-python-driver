@@ -3,7 +3,7 @@ PyMongo
 =======
 :Info: See `the mongo site <http://www.mongodb.org>`_ for more information. See `github <http://github.com/mongodb/mongo-python-driver/tree>`_ for the latest source.
 :Author: Mike Dirolf
-:Maintainer: Bernie Hackett <bernie@10gen.com>
+:Maintainer: Bernie Hackett <bernie@mongodb.com>
 
 About
 =====
@@ -16,21 +16,40 @@ is a `gridfs
 <http://www.mongodb.org/display/DOCS/GridFS+Specification>`_
 implementation on top of ``pymongo``.
 
-Issues / Questions / Feedback
-=============================
+Support / Feedback
+==================
 
-Any issues with, questions about, or feedback for PyMongo should be
-sent to the mongodb-user list on Google Groups. For confirmed issues
-or feature requests, open a case on `jira
-<http://jira.mongodb.org>`_. Please do not e-mail any of the PyMongo
-developers directly with issues or questions - you're more likely to
-get an answer on the list.
+For issues with, questions about, or feedback for PyMongo, please look into
+our `support channels <http://www.mongodb.org/about/support>`_. Please
+do not email any of the PyMongo developers directly with issues or
+questions - you're more likely to get an answer on the `mongodb-user
+<http://groups.google.com/group/mongodb-user>`_ list on Google Groups.
+
+Bugs / Feature Requests
+=======================
+
+Think you’ve found a bug? Want to see a new feature in PyMongo? Please open a
+case in our issue management tool, JIRA:
+
+- `Create an account and login <https://jira.mongodb.org>`_.
+- Navigate to `the PYTHON project <https://jira.mongodb.org/browse/PYTHON>`_.
+- Click **Create Issue** - Please provide as much information as possible about the issue type and how to reproduce it.
+
+Bug reports in JIRA for all driver projects (i.e. PYTHON, CSHARP, JAVA) and the
+Core Server (i.e. SERVER) project are **public**.
+
+Security Vulnerabilities
+------------------------
+
+If you’ve identified a security vulnerability in a driver or any other
+MongoDB project, please report it according to the `instructions here
+<http://docs.mongodb.org/manual/tutorial/create-a-vulnerability-report>`_.
 
 Installation
 ============
 
-If you have `distribute
-<http://packages.python.org/distribute/>`_ installed you
+If you have `setuptools
+<http://pythonhosted.org/setuptools/>`_ installed you
 should be able to do **easy_install pymongo** to install
 PyMongo. Otherwise you can download the project source and do **python
 setup.py install** to install.
@@ -51,37 +70,39 @@ Examples
 ========
 Here's a basic example (for more see the *examples* section of the docs):
 
->>> import pymongo
->>> connection = pymongo.MongoClient("localhost", 27017)
->>> db = connection.test
->>> db.name
-u'test'
->>> db.my_collection
-Collection(Database(MongoClient('localhost', 27017), u'test'), u'my_collection')
->>> db.my_collection.save({"x": 10})
-ObjectId('4aba15ebe23f6b53b0000000')
->>> db.my_collection.save({"x": 8})
-ObjectId('4aba160ee23f6b543e000000')
->>> db.my_collection.save({"x": 11})
-ObjectId('4aba160ee23f6b543e000002')
->>> db.my_collection.find_one()
-{u'x': 10, u'_id': ObjectId('4aba15ebe23f6b53b0000000')}
->>> for item in db.my_collection.find():
-...     print item["x"]
-...
-10
-8
-11
->>> db.my_collection.create_index("x")
-u'x_1'
->>> for item in db.my_collection.find().sort("x", pymongo.ASCENDING):
-...     print item["x"]
-...
-8
-10
-11
->>> [item["x"] for item in db.my_collection.find().limit(2).skip(1)]
-[8, 11]
+.. code-block:: pycon
+
+  >>> import pymongo
+  >>> client = pymongo.MongoClient("localhost", 27017)
+  >>> db = client.test
+  >>> db.name
+  u'test'
+  >>> db.my_collection
+  Collection(Database(MongoClient('localhost', 27017), u'test'), u'my_collection')
+  >>> db.my_collection.save({"x": 10})
+  ObjectId('4aba15ebe23f6b53b0000000')
+  >>> db.my_collection.save({"x": 8})
+  ObjectId('4aba160ee23f6b543e000000')
+  >>> db.my_collection.save({"x": 11})
+  ObjectId('4aba160ee23f6b543e000002')
+  >>> db.my_collection.find_one()
+  {u'x': 10, u'_id': ObjectId('4aba15ebe23f6b53b0000000')}
+  >>> for item in db.my_collection.find():
+  ...     print item["x"]
+  ...
+  10
+  8
+  11
+  >>> db.my_collection.create_index("x")
+  u'x_1'
+  >>> for item in db.my_collection.find().sort("x", pymongo.ASCENDING):
+  ...     print item["x"]
+  ...
+  8
+  10
+  11
+  >>> [item["x"] for item in db.my_collection.find().limit(2).skip(1)]
+  [8, 11]
 
 Documentation
 =============

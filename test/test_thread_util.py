@@ -1,4 +1,4 @@
-# Copyright 2012 10gen, Inc.
+# Copyright 2012-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,10 +25,12 @@ sys.path[0:0] = [""]
 from nose.plugins.skip import SkipTest
 
 from pymongo import thread_util
-if thread_util.have_greenlet:
-    import greenlet
+if thread_util.have_gevent:
+    import greenlet         # Plain greenlets.
+    import gevent.greenlet  # Gevent's enhanced Greenlets.
+    import gevent.hub
 
-from test.utils import looplet, RendezvousThread
+from test.utils import looplet, my_partial, RendezvousThread
 
 
 class TestIdent(unittest.TestCase):
@@ -52,11 +54,14 @@ class TestIdent(unittest.TestCase):
       child's callback was not
     """
     def _test_ident(self, use_greenlets):
+        if 'java' in sys.platform:
+            raise SkipTest("Can't rely on weakref callbacks in Jython")
+
         ident = thread_util.create_ident(use_greenlets)
 
         ids = set([ident.get()])
         unwatched_id = []
-        done = set([ident.get()]) # Start with main thread's / greenlet's id
+        done = set([ident.get()])  # Start with main thread's / greenlet's id.
         died = set()
 
         class Watched(object):
@@ -80,7 +85,7 @@ class TestIdent(unittest.TestCase):
 
             def after_rendezvous(self):
                 Watched.after_rendezvous(self)
-                self._my_ident.unwatch()
+                self._my_ident.unwatch(self.my_id)
                 assert not self._my_ident.watching()
 
         if use_greenlets:
@@ -128,7 +133,7 @@ class TestIdent(unittest.TestCase):
         del t_watched
         del t_unwatched
 
-        # Accessing the thread-local triggers cleanup in Python <= 2.6
+        # Trigger final cleanup in Python <= 2.7.0.
         # http://bugs.python.org/issue1868
         ident.get()
         self.assertEqual(3, len(ids))
@@ -148,20 +153,46 @@ class TestIdent(unittest.TestCase):
         self._test_ident(False)
 
     def test_greenlet_ident(self):
-        if not thread_util.have_greenlet:
+        if not thread_util.have_gevent:
             raise SkipTest('greenlet not installed')
 
         self._test_ident(True)
 
 
-# No functools in Python 2.4
-def my_partial(f, *args, **kwargs):
-    def _f(*new_args, **new_kwargs):
-        final_kwargs = kwargs.copy()
-        final_kwargs.update(new_kwargs)
-        return f(*(args + new_args), **final_kwargs)
+class TestGreenletIdent(unittest.TestCase):
+    def setUp(self):
+        if not thread_util.have_gevent:
+            raise SkipTest("need Gevent")
 
-    return _f
+    def test_unwatch_cleans_up(self):
+        # GreenletIdent.unwatch() should remove the on_thread_died callback
+        # from an enhanced Gevent Greenlet's list of links.
+        callback_ran = [False]
+
+        def on_greenlet_died(_):
+            callback_ran[0] = True
+
+        ident = thread_util.create_ident(use_greenlets=True)
+
+        def watch_and_unwatch():
+            ident.watch(on_greenlet_died)
+            ident.unwatch(ident.get())
+
+        g = gevent.greenlet.Greenlet(run=watch_and_unwatch)
+        g.start()
+        g.join(10)
+        the_hub = gevent.hub.get_hub()
+        if hasattr(the_hub, 'join'):
+            # Gevent 1.0
+            the_hub.join()
+        else:
+            # Gevent 0.13 and less
+            the_hub.shutdown()
+
+        self.assertTrue(g.successful())
+
+        # unwatch() canceled the callback.
+        self.assertFalse(callback_ran[0])
 
 
 class TestCounter(unittest.TestCase):
@@ -212,7 +243,7 @@ class TestCounter(unittest.TestCase):
         self._test_counter(False)
 
     def test_greenlet_counter(self):
-        if not thread_util.have_greenlet:
+        if not thread_util.have_gevent:
             raise SkipTest('greenlet not installed')
 
         self._test_counter(True)

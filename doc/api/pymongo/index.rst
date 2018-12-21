@@ -15,6 +15,13 @@
 
    .. autoclass:: pymongo.read_preferences.ReadPreference
    .. autofunction:: has_c
+   .. data:: MIN_SUPPORTED_WIRE_VERSION
+
+      The minimum wire protocol version PyMongo supports.
+
+   .. data:: MAX_SUPPORTED_WIRE_VERSION
+
+      The maximum wire protocol version PyMongo supports.
 
 Sub-modules:
 
@@ -24,7 +31,9 @@ Sub-modules:
    connection
    database
    collection
+   command_cursor
    cursor
+   bulk
    errors
    master_slave_connection
    message

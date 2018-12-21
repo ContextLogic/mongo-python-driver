@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,10 +26,6 @@ from bson.tz_util import utc
 
 
 class TestTimestamp(unittest.TestCase):
-
-    def setUp(self):
-        pass
-
     def test_timestamp(self):
         t = Timestamp(123, 456)
         self.assertEqual(t.time, 123)

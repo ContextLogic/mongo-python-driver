@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,11 @@ of keys is important. A SON object can be used just like a normal Python
 dictionary."""
 
 import copy
+import re
+
+# This sort of sucks, but seems to be as good as it gets...
+# This is essentially the same as re._pattern_type
+RE_TYPE = type(re.compile(""))
 
 
 class SON(dict):
@@ -30,29 +35,29 @@ class SON(dict):
 
     The mapping from Python types to BSON types is as follows:
 
-    ===================================  =============  ===================
-    Python Type                          BSON Type      Supported Direction
-    ===================================  =============  ===================
-    None                                 null           both
-    bool                                 boolean        both
-    int [#int]_                          int32 / int64  py -> bson
-    long                                 int64          both
-    float                                number (real)  both
-    string                               string         py -> bson
-    unicode                              string         both
-    list                                 array          both
-    dict / `SON`                         object         both
-    datetime.datetime [#dt]_ [#dt2]_     date           both
-    compiled re                          regex          both
-    `bson.binary.Binary`                 binary         both
-    `bson.objectid.ObjectId`             oid            both
-    `bson.dbref.DBRef`                   dbref          both
-    None                                 undefined      bson -> py
-    unicode                              code           bson -> py
-    `bson.code.Code`                     code           py -> bson
-    unicode                              symbol         bson -> py
-    bytes (Python 3) [#bytes]_           binary         both
-    ===================================  =============  ===================
+    =======================================  =============  ===================
+    Python Type                              BSON Type      Supported Direction
+    =======================================  =============  ===================
+    None                                     null           both
+    bool                                     boolean        both
+    int [#int]_                              int32 / int64  py -> bson
+    long                                     int64          both
+    float                                    number (real)  both
+    string                                   string         py -> bson
+    unicode                                  string         both
+    list                                     array          both
+    dict / `SON`                             object         both
+    datetime.datetime [#dt]_ [#dt2]_         date           both
+    `bson.regex.Regex` / compiled re [#re]_  regex          both
+    `bson.binary.Binary`                     binary         both
+    `bson.objectid.ObjectId`                 oid            both
+    `bson.dbref.DBRef`                       dbref          both
+    None                                     undefined      bson -> py
+    unicode                                  code           bson -> py
+    `bson.code.Code`                         code           py -> bson
+    unicode                                  symbol         bson -> py
+    bytes (Python 3) [#bytes]_               binary         both
+    =======================================  =============  ===================
 
     Note that to save binary data it must be wrapped as an instance of
     `bson.binary.Binary`. Otherwise it will be saved as a BSON string
@@ -66,6 +71,11 @@ class SON(dict):
        millisecond when saved
     .. [#dt2] all datetime.datetime instances are treated as *naive*. clients
        should always use UTC.
+    .. [#re] :class:`~bson.regex.Regex` instances and regular expression
+       objects from ``re.compile()`` are both saved as BSON regular expressions.
+       BSON regular expressions are decoded as Python regular expressions by
+       default, or as :class:`~bson.regex.Regex` instances if the ``compile_re``
+       option is set to ``False``.
     .. [#bytes] The bytes type from Python 3.x is encoded as BSON binary with
        subtype 0. In Python 3.x it will be decoded back to bytes. In Python 2.x
        it will be decoded to an instance of :class:`~bson.binary.Binary` with
@@ -216,17 +226,23 @@ class SON(dict):
         def transform_value(value):
             if isinstance(value, list):
                 return [transform_value(v) for v in value]
-            if isinstance(value, SON):
-                value = dict(value)
-            if isinstance(value, dict):
-                for k, v in value.iteritems():
-                    value[k] = transform_value(v)
-            return value
+            elif isinstance(value, dict):
+                return dict([
+                    (k, transform_value(v))
+                    for k, v in value.iteritems()])
+            else:
+                return value
 
         return transform_value(dict(self))
 
     def __deepcopy__(self, memo):
         out = SON()
+        val_id = id(self)
+        if val_id in memo:
+            return memo.get(val_id)
+        memo[val_id] = out
         for k, v in self.iteritems():
-            out[k] = copy.deepcopy(v, memo)
+            if not isinstance(v, RE_TYPE):
+                v = copy.deepcopy(v, memo)
+            out[k] = v
         return out

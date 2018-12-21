@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,19 +20,15 @@ import sys
 sys.path[0:0] = [""]
 
 import pymongo
-
+from test import host, port
 
 class TestPyMongo(unittest.TestCase):
+    def test_mongo_client_alias(self):
+        # Testing that pymongo module imports mongo_client.MongoClient
+        c = pymongo.MongoClient(host, port)
+        self.assertEqual(c.host, host)
+        self.assertEqual(c.port, port)
 
-    def setUp(self):
-        self.host = os.environ.get("DB_IP", "localhost")
-        self.port = int(os.environ.get("DB_PORT", 27017))
-
-    def test_connection_alias(self):
-        c = pymongo.Connection(self.host, self.port)
-        self.assertTrue(c)
-        self.assertEqual(c.host, self.host)
-        self.assertEqual(c.port, self.port)
 
 if __name__ == "__main__":
     unittest.main()

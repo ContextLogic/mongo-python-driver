@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ into `Mongo Extended JSON
 mode.  This lets you encode / decode BSON documents to JSON even when
 they use special BSON types.
 
-Example usage (serialization)::
+Example usage (serialization):
 
 .. doctest::
 
@@ -31,21 +31,25 @@ Example usage (serialization)::
    >>> dumps([{'foo': [1, 2]},
    ...        {'bar': {'hello': 'world'}},
    ...        {'code': Code("function x() { return 1; }")},
-   ...        {'bin': Binary("\x00\x01\x02\x03\x04")}])
-   '[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$scope": {}, "$code": "function x() { return 1; }"}}, {"bin": {"$type": "00", "$binary": "AAECAwQ="}}]'
+   ...        {'bin': Binary("\x01\x02\x03\x04")}])
+   '[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$code": "function x() { return 1; }", "$scope": {}}}, {"bin": {"$binary": "AQIDBA==", "$type": "00"}}]'
 
-Example usage (deserialization)::
+Example usage (deserialization):
 
 .. doctest::
 
    >>> from bson.json_util import loads
-   >>> loads('[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$scope": {}, "$code": "function x() { return 1; }"}}, {"bin": {"$type": "00", "$binary": "AAECAwQ="}}]')
-   [{u'foo': [1, 2]}, {u'bar': {u'hello': u'world'}}, {u'code': Code('function x() { return 1; }', {})}, {u'bin': Binary('\x00\x01\x02\x03\x04', 0)}]
+   >>> loads('[{"foo": [1, 2]}, {"bar": {"hello": "world"}}, {"code": {"$scope": {}, "$code": "function x() { return 1; }"}}, {"bin": {"$type": "00", "$binary": "AQIDBA=="}}]')
+   [{u'foo': [1, 2]}, {u'bar': {u'hello': u'world'}}, {u'code': Code('function x() { return 1; }', {})}, {u'bin': Binary('...', 0)}]
 
 Alternatively, you can manually pass the `default` to :func:`json.dumps`.
 It won't handle :class:`~bson.binary.Binary` and :class:`~bson.code.Code`
 instances (as they are extended strings you can't provide custom defaults),
 but it will be faster as there is less recursion.
+
+.. versionchanged:: 2.7
+   Preserves order when rendering SON, Timestamp, Code, Binary, and DBRef
+   instances. (But not in Python 2.4.)
 
 .. versionchanged:: 2.3
    Added dumps and loads helpers to automatically handle conversion to and
@@ -83,23 +87,38 @@ except ImportError:
         json_lib = False
 
 import bson
-from bson import EPOCH_AWARE, RE_TYPE
+from bson import EPOCH_AWARE, RE_TYPE, SON
 from bson.binary import Binary
 from bson.code import Code
 from bson.dbref import DBRef
 from bson.max_key import MaxKey
 from bson.min_key import MinKey
 from bson.objectid import ObjectId
+from bson.regex import Regex
 from bson.timestamp import Timestamp
 
 from bson.py3compat import PY3, binary_type, string_types
 
 
+_RE_OPT_TABLE = {
+    "i": re.I,
+    "l": re.L,
+    "m": re.M,
+    "s": re.S,
+    "u": re.U,
+    "x": re.X,
+}
+
+
 def dumps(obj, *args, **kwargs):
     """Helper function that wraps :class:`json.dumps`.
 
-    Recursive function that handles all BSON types incuding
+    Recursive function that handles all BSON types including
     :class:`~bson.binary.Binary` and :class:`~bson.code.Code`.
+
+    .. versionchanged:: 2.7
+       Preserves order when rendering SON, Timestamp, Code, Binary, and DBRef
+       instances. (But not in Python 2.4.)
     """
     if not json_lib:
         raise Exception("No json library available")
@@ -110,10 +129,20 @@ def loads(s, *args, **kwargs):
     """Helper function that wraps :class:`json.loads`.
 
     Automatically passes the object_hook for BSON type conversion.
+
+    :Parameters:
+      - `compile_re` (optional): if ``False``, don't attempt to compile BSON
+        regular expressions into Python regular expressions. Return instances
+        of :class:`~bson.bsonregex.BSONRegex` instead.
+
+    .. versionchanged:: 2.7
+       Added ``compile_re`` option.
     """
     if not json_lib:
         raise Exception("No json library available")
-    kwargs['object_hook'] = object_hook
+
+    compile_re = kwargs.pop('compile_re', True)
+    kwargs['object_hook'] = lambda dct: object_hook(dct, compile_re)
     return json.loads(s, *args, **kwargs)
 
 
@@ -122,7 +151,7 @@ def _json_convert(obj):
     converted into json.
     """
     if hasattr(obj, 'iteritems') or hasattr(obj, 'items'):  # PY3 support
-        return dict(((k, _json_convert(v)) for k, v in obj.iteritems()))
+        return SON(((k, _json_convert(v)) for k, v in obj.iteritems()))
     elif hasattr(obj, '__iter__') and not isinstance(obj, string_types):
         return list((_json_convert(v) for v in obj))
     try:
@@ -131,7 +160,7 @@ def _json_convert(obj):
         return obj
 
 
-def object_hook(dct):
+def object_hook(dct, compile_re=True):
     if "$oid" in dct:
         return ObjectId(str(dct["$oid"]))
     if "$ref" in dct:
@@ -141,11 +170,14 @@ def object_hook(dct):
         return EPOCH_AWARE + datetime.timedelta(seconds=secs)
     if "$regex" in dct:
         flags = 0
-        if "i" in dct["$options"]:
-            flags |= re.IGNORECASE
-        if "m" in dct["$options"]:
-            flags |= re.MULTILINE
-        return re.compile(dct["$regex"], flags)
+        # PyMongo always adds $options but some other tools may not.
+        for opt in dct.get("$options", ""):
+            flags |= _RE_OPT_TABLE.get(opt, 0)
+
+        if compile_re:
+            return re.compile(dct["$regex"], flags)
+        else:
+            return Regex(dct["$regex"], flags)
     if "$minKey" in dct:
         return MinKey()
     if "$maxKey" in dct:
@@ -165,6 +197,14 @@ def object_hook(dct):
 
 
 def default(obj):
+    # We preserve key order when rendering SON, DBRef, etc. as JSON by
+    # returning a SON for those types instead of a dict. This works with
+    # the "json" standard library in Python 2.6+ and with simplejson
+    # 2.1.0+ in Python 2.5+, because those libraries iterate the SON
+    # using PyIter_Next. Python 2.4 must use simplejson 2.0.9 or older,
+    # and those versions of simplejson use the lower-level PyDict_Next,
+    # which bypasses SON's order-preserving iteration, so we lose key
+    # order in Python 2.4.
     if isinstance(obj, ObjectId):
         return {"$oid": str(obj)}
     if isinstance(obj, DBRef):
@@ -176,28 +216,41 @@ def default(obj):
         millis = int(calendar.timegm(obj.timetuple()) * 1000 +
                      obj.microsecond / 1000)
         return {"$date": millis}
-    if isinstance(obj, RE_TYPE):
+    if isinstance(obj, (RE_TYPE, Regex)):
         flags = ""
         if obj.flags & re.IGNORECASE:
             flags += "i"
+        if obj.flags & re.LOCALE:
+            flags += "l"
         if obj.flags & re.MULTILINE:
             flags += "m"
-        return {"$regex": obj.pattern,
-                "$options": flags}
+        if obj.flags & re.DOTALL:
+            flags += "s"
+        if obj.flags & re.UNICODE:
+            flags += "u"
+        if obj.flags & re.VERBOSE:
+            flags += "x"
+        if isinstance(obj.pattern, unicode):
+            pattern = obj.pattern
+        else:
+            pattern = obj.pattern.decode('utf-8')
+        return SON([("$regex", pattern), ("$options", flags)])
     if isinstance(obj, MinKey):
         return {"$minKey": 1}
     if isinstance(obj, MaxKey):
         return {"$maxKey": 1}
     if isinstance(obj, Timestamp):
-        return {"t": obj.time, "i": obj.inc}
+        return SON([("t", obj.time), ("i", obj.inc)])
     if isinstance(obj, Code):
-        return {'$code': "%s" % obj, '$scope': obj.scope}
+        return SON([('$code', str(obj)), ('$scope', obj.scope)])
     if isinstance(obj, Binary):
-        return {'$binary': base64.b64encode(obj).decode(),
-                '$type': "%02x" % obj.subtype}
+        return SON([
+            ('$binary', base64.b64encode(obj).decode()),
+            ('$type', "%02x" % obj.subtype)])
     if PY3 and isinstance(obj, binary_type):
-        return {'$binary': base64.b64encode(obj).decode(),
-                '$type': "00"}
+        return SON([
+            ('$binary', base64.b64encode(obj).decode()),
+            ('$type', "00")])
     if bson.has_uuid() and isinstance(obj, bson.uuid.UUID):
         return {"$uuid": obj.hex}
     raise TypeError("%r is not JSON serializable" % obj)

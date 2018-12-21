@@ -4,7 +4,7 @@
 .. automodule:: pymongo.mongo_client
    :synopsis: Tools for connecting to MongoDB
 
-   .. autoclass:: pymongo.mongo_client.MongoClient([host='localhost'[, port=27017[, max_pool_size=10[, document_class=dict[, tz_aware=False[, **kwargs]]]]]])
+   .. autoclass:: pymongo.mongo_client.MongoClient([host='localhost'[, port=27017[, max_pool_size=100[, document_class=dict[, tz_aware=False[, **kwargs]]]]]])
 
       .. automethod:: disconnect
       .. automethod:: close
@@ -26,14 +26,19 @@
       .. autoattribute:: document_class
       .. autoattribute:: tz_aware
       .. autoattribute:: max_bson_size
+      .. autoattribute:: max_message_size
+      .. autoattribute:: min_wire_version
+      .. autoattribute:: max_wire_version
       .. autoattribute:: read_preference
       .. autoattribute:: tag_sets
       .. autoattribute:: secondary_acceptable_latency_ms
       .. autoattribute:: write_concern
+      .. autoattribute:: uuid_subtype
       .. autoattribute:: is_locked
       .. automethod:: database_names
       .. automethod:: drop_database
       .. automethod:: copy_database(from_name, to_name[, from_host=None[, username=None[, password=None]]])
+      .. automethod:: get_default_database
       .. automethod:: server_info
       .. automethod:: start_request
       .. automethod:: end_request

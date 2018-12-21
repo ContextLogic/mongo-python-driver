@@ -1,4 +1,4 @@
-# Copyright 2011-2012 10gen, Inc.
+# Copyright 2011-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -41,7 +41,7 @@ class ReplicaSetConnection(MongoReplicaSetClient):
     """Connection to a MongoDB replica set.
     """
 
-    def __init__(self, hosts_or_uri=None, max_pool_size=10,
+    def __init__(self, hosts_or_uri=None, max_pool_size=None,
                  document_class=dict, tz_aware=False, **kwargs):
         """Create a new connection to a MongoDB replica set.
 
@@ -80,8 +80,10 @@ class ReplicaSetConnection(MongoReplicaSetClient):
             pairs. If a host is an IPv6 literal it must be enclosed in '[' and
             ']' characters following the RFC2732 URL syntax (e.g. '[::1]' for
             localhost)
-          - `max_pool_size` (optional): The maximum size limit for
-            each connection pool.
+          - `max_pool_size` (optional): The maximum number of connections
+            each pool will open simultaneously. If this is set, operations
+            will block if there are `max_pool_size` outstanding connections
+            from the pool. By default the pool size is unlimited.
           - `document_class` (optional): default class to use for
             documents returned from queries on this connection
           - `tz_aware` (optional): if ``True``,
@@ -93,7 +95,44 @@ class ReplicaSetConnection(MongoReplicaSetClient):
             this replica set. Can be passed as a keyword argument or as a
             MongoDB URI option.
 
-          **Other optional parameters can be passed as keyword arguments:**
+          | **Other optional parameters can be passed as keyword arguments:**
+
+          - `host`: For compatibility with connection.Connection. If both
+            `host` and `hosts_or_uri` are specified `host` takes precedence.
+          - `port`: For compatibility with connection.Connection. The default
+            port number to use for hosts.
+          - `network_timeout`: For compatibility with connection.Connection.
+            The timeout (in seconds) to use for socket operations - default
+            is no timeout. If both `network_timeout` and `socketTimeoutMS` are
+            specified `network_timeout` takes precedence, matching
+            connection.Connection.
+          - `socketTimeoutMS`: (integer) How long (in milliseconds) a send or
+            receive on a socket can take before timing out. Defaults to ``None``
+            (no timeout).
+          - `connectTimeoutMS`: (integer) How long (in milliseconds) a
+            connection can take to be opened before timing out. Defaults to
+            ``20000``.
+          - `waitQueueTimeoutMS`: (integer) How long (in milliseconds) a
+            thread will wait for a socket from the pool if the pool has no
+            free sockets. Defaults to ``None`` (no timeout).
+          - `waitQueueMultiple`: (integer) Multiplied by max_pool_size to give
+            the number of threads allowed to wait for a socket at one time.
+            Defaults to ``None`` (no waiters).
+          - `auto_start_request`: If ``True`` (the default), each thread that
+            accesses this :class:`ReplicaSetConnection` has a socket allocated
+            to it for the thread's lifetime, for each member of the set. For
+            :class:`~pymongo.read_preferences.ReadPreference` PRIMARY,
+            auto_start_request=True ensures consistent reads, even if you read
+            after an unsafe write. For read preferences other than PRIMARY,
+            there are no consistency guarantees.
+          - `use_greenlets`: if ``True``, use a background Greenlet instead of
+            a background thread to monitor state of replica set. Additionally,
+            :meth:`start_request()` will ensure that the current greenlet uses
+            the same socket for all operations until :meth:`end_request()`.
+            `use_greenlets` with ReplicaSetConnection requires `Gevent
+            <http://gevent.org/>`_ to be installed.
+
+          | **Write Concern options:**
 
           - `safe`: :class:`ReplicaSetConnection` **disables** acknowledgement
             of write operations. Use ``safe=True`` to enable write
@@ -108,16 +147,21 @@ class ReplicaSetConnection(MongoReplicaSetClient):
             to complete. If replication does not complete in the given
             timeframe, a timeout exception is raised. Implies safe=True.
           - `j`: If ``True`` block until write operations have been committed
-            to the journal. Ignored if the server is running without journaling.
-            Implies safe=True.
-          - `fsync`: If ``True`` force the database to fsync all files before
-            returning. When used with `j` the server awaits the next group
-            commit before returning. Implies safe=True.
-          - `socketTimeoutMS`: (integer) How long (in milliseconds) a send or
-            receive on a socket can take before timing out.
-          - `connectTimeoutMS`: (integer) How long (in milliseconds) a
-            connection can take to be opened before timing out.
-          - `ssl`: If ``True``, create the connection to the servers using SSL.
+            to the journal. Cannot be used in combination with `fsync`. Prior
+            to MongoDB 2.6 this option was ignored if the server was running
+            without journaling. Starting with MongoDB 2.6 write operations will
+            fail with an exception if this option is used when the server is
+            running without journaling. Implies safe=True.
+          - `fsync`: If ``True`` and the server is running without journaling,
+            blocks until the server has synced all data files to disk. If the
+            server is running with journaling, this acts the same as the `j`
+            option, blocking until write operations have been committed to the
+            journal. Cannot be used in combination with `j`. Implies safe=True.
+
+          | **Read preference options:**
+
+          - `slave_okay` or `slaveOk` (deprecated): Use `read_preference`
+            instead.
           - `read_preference`: The read preference for this connection.
             See :class:`~pymongo.read_preferences.ReadPreference` for available
           - `tag_sets`: Read from replica-set members with these tags.
@@ -130,32 +174,32 @@ class ReplicaSetConnection(MongoReplicaSetClient):
           - `secondary_acceptable_latency_ms`: (integer) Any replica-set member
             whose ping time is within secondary_acceptable_latency_ms of the
             nearest member may accept reads. Default 15 milliseconds.
-          - `auto_start_request`: If ``True`` (the default), each thread that
-            accesses this :class:`ReplicaSetConnection` has a socket allocated
-            to it for the thread's lifetime, for each member of the set. For
-            :class:`~pymongo.read_preferences.ReadPreference` PRIMARY,
-            auto_start_request=True ensures consistent reads, even if you read
-            after an unsafe write. For read preferences other than PRIMARY,
-            there are no consistency guarantees.
-          - `use_greenlets`: if ``True``, use a background Greenlet instead of
-            a background thread to monitor state of replica set. Additionally,
-            :meth:`start_request()` will ensure that the current greenlet uses
-            the same socket for all operations until :meth:`end_request()`.
-            `use_greenlets` with ReplicaSetConnection requires `Gevent
-            <http://gevent.org/>`_ to be installed.
-          - `slave_okay` or `slaveOk` (deprecated): Use `read_preference`
-            instead.
-          - `host`: For compatibility with connection.Connection. If both
-            `host` and `hosts_or_uri` are specified `host` takes precedence.
-          - `port`: For compatibility with connection.Connection. The default
-            port number to use for hosts.
-          - `network_timeout`: For compatibility with connection.Connection.
-            The timeout (in seconds) to use for socket operations - default
-            is no timeout. If both `network_timeout` and `socketTimeoutMS` are
-            are specified `network_timeout` takes precedence, matching
-            connection.Connection.
+            **Ignored by mongos** and must be configured on the command line.
+            See the localThreshold_ option for more information.
 
+          | **SSL configuration:**
 
+          - `ssl`: If ``True``, create the connection to the servers using SSL.
+          - `ssl_keyfile`: The private keyfile used to identify the local
+            connection against mongod.  If included with the ``certfile` then
+            only the ``ssl_certfile`` is needed.  Implies ``ssl=True``.
+          - `ssl_certfile`: The certificate file used to identify the local
+            connection against mongod. Implies ``ssl=True``.
+          - `ssl_cert_reqs`: Specifies whether a certificate is required from
+            the other side of the connection, and whether it will be validated
+            if provided. It must be one of the three values ``ssl.CERT_NONE``
+            (certificates ignored), ``ssl.CERT_OPTIONAL``
+            (not required, but validated if provided), or ``ssl.CERT_REQUIRED``
+            (required and validated). If the value of this parameter is not
+            ``ssl.CERT_NONE``, then the ``ssl_ca_certs`` parameter must point
+            to a file of CA certificates. Implies ``ssl=True``.
+          - `ssl_ca_certs`: The ca_certs file contains a set of concatenated
+            "certification authority" certificates, which are used to validate
+            certificates passed from the other end of the connection.
+            Implies ``ssl=True``.
+
+        .. versionchanged:: 2.5
+           Added additional ssl options
         .. versionchanged:: 2.3
            Added `tag_sets` and `secondary_acceptable_latency_ms` options.
         .. versionchanged:: 2.2
@@ -163,6 +207,8 @@ class ReplicaSetConnection(MongoReplicaSetClient):
            Added support for `host`, `port`, and `network_timeout` keyword
            arguments for compatibility with connection.Connection.
         .. versionadded:: 2.1
+
+        .. _localThreshold: http://docs.mongodb.org/manual/reference/mongos/#cmdoption-mongos--localThreshold
         """
         network_timeout = kwargs.pop('network_timeout', None)
         if network_timeout is not None:

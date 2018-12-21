@@ -1,4 +1,4 @@
-# Copyright 2011-2012 10gen, Inc.
+# Copyright 2011-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -14,16 +14,61 @@
 
 
 """Functions and classes common to multiple pymongo modules."""
+import sys
 import warnings
+import tornado.ioloop
 from pymongo import read_preferences
 
+from pymongo.auth import MECHANISMS
 from pymongo.read_preferences import ReadPreference
 from pymongo.errors import ConfigurationError
+from bson.binary import (OLD_UUID_SUBTYPE, UUID_SUBTYPE,
+                         JAVA_LEGACY, CSHARP_LEGACY)
+
+HAS_SSL = True
+try:
+    import ssl
+except ImportError:
+    HAS_SSL = False
+
+
+# Jython 2.7 includes an incomplete ssl module. See PYTHON-498.
+if sys.platform.startswith('java'):
+    HAS_SSL = False
+
+
+# Defaults until we connect to a server and get updated limits.
+MAX_BSON_SIZE = 16 * (1024 ** 2)
+MAX_MESSAGE_SIZE = 2 * MAX_BSON_SIZE
+MIN_WIRE_VERSION = 0
+MAX_WIRE_VERSION = 0
+MAX_WRITE_BATCH_SIZE = 1000
+
+# What this version of PyMongo supports.
+MIN_SUPPORTED_WIRE_VERSION = 0
+MAX_SUPPORTED_WIRE_VERSION = 2
+
+# mongod/s 2.6 and above return code 59 when a
+# command doesn't exist. mongod versions previous
+# to 2.6 and mongos 2.4.x return no error code
+# when a command does exist. mongos versions previous
+# to 2.4.0 return code 13390 when a command does not
+# exist.
+COMMAND_NOT_FOUND_CODES = (59, 13390, None)
 
 
 def raise_config_error(key, dummy):
     """Raise ConfigurationError with the given key name."""
     raise ConfigurationError("Unknown option %s" % (key,))
+
+
+# Mapping of URI uuid representation options to valid subtypes.
+_UUID_SUBTYPES = {
+    'standard': UUID_SUBTYPE,
+    'pythonLegacy': OLD_UUID_SUBTYPE,
+    'javaLegacy': JAVA_LEGACY,
+    'csharpLegacy': CSHARP_LEGACY
+}
 
 
 def validate_boolean(option, value):
@@ -60,6 +105,41 @@ def validate_positive_integer(option, value):
         raise ConfigurationError("The value of %s must be "
                                  "a positive integer" % (option,))
     return val
+
+
+def validate_readable(option, value):
+    """Validates that 'value' is file-like and readable.
+    """
+    # First make sure its a string py3.3 open(True, 'r') succeeds
+    # Used in ssl cert checking due to poor ssl module error reporting
+    value = validate_basestring(option, value)
+    open(value, 'r').close()
+    return value
+
+
+def validate_cert_reqs(option, value):
+    """Validate the cert reqs are valid. It must be None or one of the three
+    values ``ssl.CERT_NONE``, ``ssl.CERT_OPTIONAL`` or ``ssl.CERT_REQUIRED``"""
+    if value is None:
+        return value
+    if HAS_SSL:
+        if value in (ssl.CERT_NONE, ssl.CERT_OPTIONAL, ssl.CERT_REQUIRED):
+            return value
+        raise ConfigurationError("The value of %s must be one of: "
+                                 "`ssl.CERT_NONE`, `ssl.CERT_OPTIONAL` or "
+                                 "`ssl.CERT_REQUIRED" % (option,))
+    else:
+        raise ConfigurationError("The value of %s is set but can't be "
+                                 "validated. The ssl module is not available"
+                                 % (option,))
+
+
+def validate_positive_integer_or_none(option, value):
+    """Validate that 'value' is a positive integer or None.
+    """
+    if value is None:
+        return value
+    return validate_positive_integer(option, value)
 
 
 def validate_basestring(option, value):
@@ -114,9 +194,14 @@ def validate_timeout_or_none(option, value):
 def validate_read_preference(dummy, value):
     """Validate read preference for a ReplicaSetConnection.
     """
-    if value not in read_preferences.modes:
+    if value in read_preferences.modes:
+        return value
+
+    # Also allow string form of enum for uri_parser
+    try:
+        return read_preferences.mongos_enum(value)
+    except ValueError:
         raise ConfigurationError("Not a valid read preference")
-    return value
 
 
 def validate_tag_sets(dummy, value):
@@ -127,7 +212,7 @@ def validate_tag_sets(dummy, value):
 
     if not isinstance(value, list):
         raise ConfigurationError((
-            "Tag sets %s invalid, must be a list" ) % repr(value))
+            "Tag sets %s invalid, must be a list") % repr(value))
     if len(value) == 0:
         raise ConfigurationError((
             "Tag sets %s invalid, must be None or contain at least one set of"
@@ -140,9 +225,43 @@ def validate_tag_sets(dummy, value):
 
     return value
 
+def validate_io_loop(dummy, value):
+    return value is None or isinstance(value, tornado.ioloop.IOLoop)
+
+
+def validate_auth_mechanism(option, value):
+    """Validate the authMechanism URI option.
+    """
+    # CRAM-MD5 is for server testing only. Undocumented,
+    # unsupported, may be removed at any time. You have
+    # been warned.
+    if value not in MECHANISMS and value != 'CRAM-MD5':
+        raise ConfigurationError("%s must be in "
+                                 "%s" % (option, MECHANISMS))
+    return value
+
+
+def validate_uuid_representation(dummy, value):
+    """Validate the uuid representation option selected in the URI.
+    """
+    if value not in _UUID_SUBTYPES.keys():
+        raise ConfigurationError("%s is an invalid UUID representation. "
+                                 "Must be one of "
+                                 "%s" % (value, _UUID_SUBTYPES.keys()))
+    return _UUID_SUBTYPES[value]
+
+
+def validate_uuid_subtype(dummy, value):
+    """Validate the uuid subtype option, a numerical value whose acceptable
+    values are defined in bson.binary."""
+    if value not in _UUID_SUBTYPES.values():
+        raise ConfigurationError("Not a valid setting for uuid_subtype.")
+    return value
+
 
 # jounal is an alias for j,
-# wtimeoutms is an alias for wtimeout
+# wtimeoutms is an alias for wtimeout,
+# readpreferencetags is an alias for tag_sets.
 VALIDATORS = {
     'replicaset': validate_basestring,
     'slaveok': validate_boolean,
@@ -156,14 +275,41 @@ VALIDATORS = {
     'journal': validate_boolean,
     'connecttimeoutms': validate_timeout_or_none,
     'sockettimeoutms': validate_timeout_or_none,
+    'waitqueuetimeoutms': validate_timeout_or_none,
+    'waitqueuemultiple': validate_positive_integer_or_none,
     'ssl': validate_boolean,
+    'ssl_keyfile': validate_readable,
+    'ssl_certfile': validate_readable,
+    'ssl_cert_reqs': validate_cert_reqs,
+    'ssl_ca_certs': validate_readable,
+    'readpreference': validate_read_preference,
     'read_preference': validate_read_preference,
+    'readpreferencetags': validate_tag_sets,
     'tag_sets': validate_tag_sets,
     'secondaryacceptablelatencyms': validate_positive_float,
     'secondary_acceptable_latency_ms': validate_positive_float,
     'auto_start_request': validate_boolean,
     'use_greenlets': validate_boolean,
+    'authmechanism': validate_auth_mechanism,
+    'authsource': validate_basestring,
+    'gssapiservicename': validate_basestring,
+    'uuidrepresentation': validate_uuid_representation,
+    'use_greenlet_async': validate_boolean,
+    'io_loop': validate_io_loop
 }
+
+
+_AUTH_OPTIONS = frozenset(['gssapiservicename'])
+
+
+def validate_auth_option(option, value):
+    """Validate optional authentication parameters.
+    """
+    lower, value = validate(option, value)
+    if lower not in _AUTH_OPTIONS:
+        raise ConfigurationError('Unknown '
+                                 'authentication option: %s' % (option,))
+    return lower, value
 
 
 def validate(option, value):
@@ -205,7 +351,7 @@ class BaseObject(object):
     """A base class that provides attributes and methods common
     to multiple pymongo classes.
 
-    SHOULD NOT BE USED BY DEVELOPERS EXTERNAL TO 10GEN
+    SHOULD NOT BE USED BY DEVELOPERS EXTERNAL TO MONGODB.
     """
 
     def __init__(self, **options):
@@ -215,11 +361,11 @@ class BaseObject(object):
         self.__tag_sets = [{}]
         self.__secondary_acceptable_latency_ms = 15
         self.__safe = None
+        self.__uuid_subtype = OLD_UUID_SUBTYPE
         self.__write_concern = WriteConcern()
         self.__set_options(options)
         if (self.__read_pref == ReadPreference.PRIMARY
-            and self.__tag_sets != [{}]
-        ):
+                and self.__tag_sets != [{}]):
             raise ConfigurationError(
                 "ReadPreference PRIMARY cannot be combined with tags")
 
@@ -228,13 +374,15 @@ class BaseObject(object):
             if options.get("w") == 0:
                 self.__safe = False
             else:
-                self.__safe = validate_boolean('safe', options.get("safe", True))
+                self.__safe = validate_boolean('safe',
+                                               options.get("safe", True))
         # Note: 'safe' is always passed by Connection and ReplicaSetConnection
         # Always do the most "safe" thing, but warn about conflicts.
         if self.__safe and options.get('w') == 0:
-            warnings.warn("Conflicting write concerns.  'w' set to 0 "
-                          "but other options have enabled write concern. "
-                          "Please set 'w' to a value other than 0.",
+
+            warnings.warn("Conflicting write concerns: %s. Write concern "
+                          "options were configured, but w=0 disables all "
+                          "other options." % self.write_concern,
                           UserWarning)
 
     def __set_safe_option(self, option, value):
@@ -253,10 +401,12 @@ class BaseObject(object):
         for option, value in options.iteritems():
             if option in ('slave_okay', 'slaveok'):
                 self.__slave_okay = validate_boolean(option, value)
-            elif option == 'read_preference':
+            elif option in ('read_preference', "readpreference"):
                 self.__read_pref = validate_read_preference(option, value)
-            elif option == 'tag_sets':
+            elif option in ('tag_sets', 'readpreferencetags'):
                 self.__tag_sets = validate_tag_sets(option, value)
+            elif option == 'uuidrepresentation':
+                self.__uuid_subtype = validate_uuid_subtype(option, value)
             elif option in (
                 'secondaryacceptablelatencyms',
                 'secondary_acceptable_latency_ms'
@@ -301,10 +451,16 @@ class BaseObject(object):
           to complete. If replication does not complete in the given
           timeframe, a timeout exception is raised.
         - `j`: If ``True`` block until write operations have been committed
-          to the journal. Ignored if the server is running without journaling.
-        - `fsync`: If ``True`` force the database to fsync all files before
-          returning. When used with `j` the server awaits the next group
-          commit before returning.
+          to the journal. Cannot be used in combination with `fsync`. Prior
+          to MongoDB 2.6 this option was ignored if the server was running
+          without journaling. Starting with MongoDB 2.6 write operations will
+          fail with an exception if this option is used when the server is
+          running without journaling.
+        - `fsync`: If ``True`` and the server is running without journaling,
+          blocks until the server has synced all data files to disk. If the
+          server is running with journaling, this acts the same as the `j`
+          option, blocking until write operations have been committed to the
+          journal. Cannot be used in combination with `j`.
 
         >>> m = pymongo.MongoClient()
         >>> m.write_concern
@@ -325,6 +481,14 @@ class BaseObject(object):
 
         .. note:: Accessing :attr:`write_concern` returns its value
            (a subclass of :class:`dict`), not a copy.
+
+        .. warning:: If you are using :class:`~pymongo.connection.Connection`
+           or :class:`~pymongo.replica_set_connection.ReplicaSetConnection`
+           make sure you explicitly set ``w`` to 1 (or a greater value) or
+           :attr:`safe` to ``True``. Unlike calling
+           :meth:`set_lasterror_options`, setting an option in
+           :attr:`write_concern` does not implicitly set :attr:`safe`
+           to ``True``.
         """
         # To support dict style access we have to return the actual
         # WriteConcern here, not a copy.
@@ -344,7 +508,8 @@ class BaseObject(object):
     def __set_slave_okay(self, value):
         """Property setter for slave_okay"""
         warnings.warn("slave_okay is deprecated. Please use "
-                      "read_preference instead.", DeprecationWarning)
+                      "read_preference instead.", DeprecationWarning,
+                      stacklevel=2)
         self.__slave_okay = validate_boolean('slave_okay', value)
 
     slave_okay = property(__get_slave_okay, __set_slave_okay)
@@ -352,7 +517,8 @@ class BaseObject(object):
     def __get_read_pref(self):
         """The read preference mode for this instance.
 
-        See :class:`~pymongo.read_preferences.ReadPreference` for available options.
+        See :class:`~pymongo.read_preferences.ReadPreference` for
+        available options.
 
         .. versionadded:: 2.1
         """
@@ -372,6 +538,12 @@ class BaseObject(object):
         See :class:`~pymongo.read_preferences.ReadPreference`.
 
         .. versionadded:: 2.3
+
+        .. note:: ``secondary_acceptable_latency_ms`` is ignored when talking
+          to a replica set *through* a mongos. The equivalent is the
+          localThreshold_ command line option.
+
+        .. _localThreshold: http://docs.mongodb.org/manual/reference/mongos/#cmdoption-mongos--localThreshold
         """
         return self.__secondary_acceptable_latency_ms
 
@@ -405,6 +577,21 @@ class BaseObject(object):
 
     tag_sets = property(__get_tag_sets, __set_tag_sets)
 
+    def __get_uuid_subtype(self):
+        """This attribute specifies which BSON Binary subtype is used when
+        storing UUIDs. Historically UUIDs have been stored as BSON Binary
+        subtype 3. This attribute is used to switch to the newer BSON Binary
+        subtype 4. It can also be used to force legacy byte order and subtype
+        compatibility with the Java and C# drivers. See the :mod:`bson.binary`
+        module for all options."""
+        return self.__uuid_subtype
+
+    def __set_uuid_subtype(self, value):
+        """Sets the BSON Binary subtype to be used when storing UUIDs."""
+        self.__uuid_subtype = validate_uuid_subtype("uuid_subtype", value)
+
+    uuid_subtype = property(__get_uuid_subtype, __set_uuid_subtype)
+
     def __get_safe(self):
         """**DEPRECATED:** Use the 'w' :attr:`write_concern` option instead.
 
@@ -418,7 +605,7 @@ class BaseObject(object):
         """Property setter for safe"""
         warnings.warn("safe is deprecated. Please use the"
                       " 'w' write_concern option instead.",
-                      DeprecationWarning)
+                      DeprecationWarning, stacklevel=2)
         self.__safe = validate_boolean('safe', value)
 
     safe = property(__get_safe, __set_safe)
@@ -433,7 +620,8 @@ class BaseObject(object):
         .. versionadded:: 2.0
         """
         warnings.warn("get_lasterror_options is deprecated. Please use "
-                      "write_concern instead.", DeprecationWarning)
+                      "write_concern instead.", DeprecationWarning,
+                      stacklevel=2)
         return self.__write_concern.copy()
 
     def set_lasterror_options(self, **kwargs):
@@ -453,7 +641,8 @@ class BaseObject(object):
         .. versionadded:: 2.0
         """
         warnings.warn("set_lasterror_options is deprecated. Please use "
-                      "write_concern instead.", DeprecationWarning)
+                      "write_concern instead.", DeprecationWarning,
+                      stacklevel=2)
         for key, value in kwargs.iteritems():
             self.__set_safe_option(key, value)
 
@@ -473,7 +662,8 @@ class BaseObject(object):
         .. versionadded:: 2.0
         """
         warnings.warn("unset_lasterror_options is deprecated. Please use "
-                      "write_concern instead.", DeprecationWarning)
+                      "write_concern instead.", DeprecationWarning,
+                      stacklevel=2)
         if len(options):
             for option in options:
                 self.__write_concern.pop(option, None)
@@ -512,7 +702,8 @@ class BaseObject(object):
 
         if safe is not None:
             warnings.warn("The safe parameter is deprecated. Please use "
-                          "write concern options instead.", DeprecationWarning)
+                          "write concern options instead.", DeprecationWarning,
+                          stacklevel=3)
             validate_boolean('safe', safe)
 
         # Passed options override collection level defaults.
@@ -534,7 +725,9 @@ class BaseObject(object):
 
         # Fall back to collection level defaults.
         # w=0 takes precedence over self.safe = True
-        if self.safe and self.__write_concern.get('w') != 0:
+        if self.__write_concern.get('w') == 0:
+            return False, {}
+        elif self.safe or self.__write_concern.get('w', 0) != 0:
             return True, pop1(self.__write_concern.copy())
 
         return False, {}

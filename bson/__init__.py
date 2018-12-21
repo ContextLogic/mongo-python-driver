@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,7 +32,8 @@ from bson.max_key import MaxKey
 from bson.min_key import MinKey
 from bson.objectid import ObjectId
 from bson.py3compat import b, binary_type
-from bson.son import SON
+from bson.regex import Regex
+from bson.son import SON, RE_TYPE
 from bson.timestamp import Timestamp
 from bson.tz_util import utc
 
@@ -51,9 +52,6 @@ except ImportError:
 
 PY3 = sys.version_info[0] == 3
 
-
-# This sort of sucks, but seems to be as good as it gets...
-RE_TYPE = type(re.compile(""))
 
 MAX_INT32 = 2147483647
 MIN_INT32 = -2147483648
@@ -93,7 +91,8 @@ BSONMAX = b("\x7F") # Max key
 
 
 def _get_int(data, position, as_class=None,
-             tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE, unsigned=False):
+             tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE,
+             compile_re=True, unsigned=False):
     format = unsigned and "I" or "i"
     try:
         value = struct.unpack("<%s" % format, data[position:position + 4])[0]
@@ -135,32 +134,40 @@ def _make_c_string(string, check_null=False):
                                     "UTF-8: %r" % string)
 
 
-def _get_number(data, position, as_class, tz_aware, uuid_subtype):
+def _get_number(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     num = struct.unpack("<d", data[position:position + 8])[0]
     position += 8
     return num, position
 
 
-def _get_string(data, position, as_class, tz_aware, uuid_subtype):
-    length = struct.unpack("<i", data[position:position + 4])[0] - 1
+def _get_string(data, position, as_class, tz_aware, uuid_subtype, compile_re):
+    length = struct.unpack("<i", data[position:position + 4])[0]
+    if length <= 0 or (len(data) - position - 4) < length:
+        raise InvalidBSON("invalid string length")
     position += 4
-    return _get_c_string(data, position, length)
+    if data[position + length - 1:position + length] != ZERO:
+        raise InvalidBSON("invalid end of string")
+    return _get_c_string(data, position, length - 1)
 
 
-def _get_object(data, position, as_class, tz_aware, uuid_subtype):
+def _get_object(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     obj_size = struct.unpack("<i", data[position:position + 4])[0]
+    if data[position + obj_size - 1:position + obj_size] != ZERO:
+        raise InvalidBSON("bad eoo")
     encoded = data[position + 4:position + obj_size - 1]
-    object = _elements_to_dict(encoded, as_class, tz_aware, uuid_subtype)
+    object = _elements_to_dict(
+        encoded, as_class, tz_aware, uuid_subtype, compile_re)
+
     position += obj_size
     if "$ref" in object:
-        return (DBRef(object.pop("$ref"), object.pop("$id"),
+        return (DBRef(object.pop("$ref"), object.pop("$id", None),
                       object.pop("$db", None), object), position)
     return object, position
 
 
-def _get_array(data, position, as_class, tz_aware, uuid_subtype):
+def _get_array(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     obj, position = _get_object(data, position,
-                                as_class, tz_aware, uuid_subtype)
+                                as_class, tz_aware, uuid_subtype, compile_re)
     result = []
     i = 0
     while True:
@@ -172,7 +179,7 @@ def _get_array(data, position, as_class, tz_aware, uuid_subtype):
     return result, position
 
 
-def _get_binary(data, position, as_class, tz_aware, uuid_subtype):
+def _get_binary(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     length, position = _get_int(data, position)
     subtype = ord(data[position:position + 1])
     position += 1
@@ -204,19 +211,19 @@ def _get_binary(data, position, as_class, tz_aware, uuid_subtype):
 
 
 def _get_oid(data, position, as_class=None,
-             tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE):
+             tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE, compile_re=True):
     value = ObjectId(data[position:position + 12])
     position += 12
     return value, position
 
 
-def _get_boolean(data, position, as_class, tz_aware, uuid_subtype):
+def _get_boolean(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     value = data[position:position + 1] == ONE
     position += 1
     return value, position
 
 
-def _get_date(data, position, as_class, tz_aware, uuid_subtype):
+def _get_date(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     millis = struct.unpack("<q", data[position:position + 8])[0]
     diff = millis % 1000
     seconds = (millis - diff) / 1000
@@ -228,58 +235,51 @@ def _get_date(data, position, as_class, tz_aware, uuid_subtype):
     return dt.replace(microsecond=diff * 1000), position
 
 
-def _get_code(data, position, as_class, tz_aware, uuid_subtype):
+def _get_code(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     code, position = _get_string(data, position,
-                                 as_class, tz_aware, uuid_subtype)
+                                 as_class, tz_aware, uuid_subtype, compile_re)
     return Code(code), position
 
 
-def _get_code_w_scope(data, position, as_class, tz_aware, uuid_subtype):
+def _get_code_w_scope(
+        data, position, as_class, tz_aware, uuid_subtype, compile_re):
     _, position = _get_int(data, position)
     code, position = _get_string(data, position,
-                                 as_class, tz_aware, uuid_subtype)
+                                 as_class, tz_aware, uuid_subtype, compile_re)
     scope, position = _get_object(data, position,
-                                  as_class, tz_aware, uuid_subtype)
+                                  as_class, tz_aware, uuid_subtype, compile_re)
     return Code(code, scope), position
 
 
-def _get_null(data, position, as_class, tz_aware, uuid_subtype):
+def _get_null(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     return None, position
 
 
-def _get_regex(data, position, as_class, tz_aware, uuid_subtype):
+def _get_regex(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     pattern, position = _get_c_string(data, position)
     bson_flags, position = _get_c_string(data, position)
-    flags = 0
-    if "i" in bson_flags:
-        flags |= re.IGNORECASE
-    if "l" in bson_flags:
-        flags |= re.LOCALE
-    if "m" in bson_flags:
-        flags |= re.MULTILINE
-    if "s" in bson_flags:
-        flags |= re.DOTALL
-    if "u" in bson_flags:
-        flags |= re.UNICODE
-    if "x" in bson_flags:
-        flags |= re.VERBOSE
-    return re.compile(pattern, flags), position
+    bson_re = Regex(pattern, bson_flags)
+    if compile_re:
+        return bson_re.try_compile(), position
+    else:
+        return bson_re, position
 
 
-def _get_ref(data, position, as_class, tz_aware, uuid_subtype):
-    position += 4
-    collection, position = _get_c_string(data, position)
+def _get_ref(data, position, as_class, tz_aware, uuid_subtype, compile_re):
+    collection, position = _get_string(data, position, as_class, tz_aware,
+                                       uuid_subtype, compile_re)
     oid, position = _get_oid(data, position)
     return DBRef(collection, oid), position
 
 
-def _get_timestamp(data, position, as_class, tz_aware, uuid_subtype):
+def _get_timestamp(
+        data, position, as_class, tz_aware, uuid_subtype, compile_re):
     inc, position = _get_int(data, position, unsigned=True)
     timestamp, position = _get_int(data, position, unsigned=True)
     return Timestamp(timestamp, inc), position
 
 
-def _get_long(data, position, as_class, tz_aware, uuid_subtype):
+def _get_long(data, position, as_class, tz_aware, uuid_subtype, compile_re):
     # Have to cast to long; on 32-bit unpack may return an int.
     # 2to3 will change long to int. That's fine since long doesn't
     # exist in python3.
@@ -307,30 +307,32 @@ _element_getter = {
     BSONINT: _get_int,  # number_int
     BSONTIM: _get_timestamp,
     BSONLON: _get_long, # Same as _get_int after 2to3 runs.
-    BSONMIN: lambda v, w, x, y, z: (MinKey(), w),
-    BSONMAX: lambda v, w, x, y, z: (MaxKey(), w)}
+    BSONMIN: lambda u, v, w, x, y, z: (MinKey(), v),
+    BSONMAX: lambda u, v, w, x, y, z: (MaxKey(), v)}
 
 
-def _element_to_dict(data, position, as_class, tz_aware, uuid_subtype):
+def _element_to_dict(
+        data, position, as_class, tz_aware, uuid_subtype, compile_re):
     element_type = data[position:position + 1]
     position += 1
     element_name, position = _get_c_string(data, position)
-    value, position = _element_getter[element_type](data, position, as_class,
-                                                    tz_aware, uuid_subtype)
+    value, position = _element_getter[element_type](
+        data, position, as_class, tz_aware, uuid_subtype, compile_re)
+
     return element_name, value, position
 
 
-def _elements_to_dict(data, as_class, tz_aware, uuid_subtype):
+def _elements_to_dict(data, as_class, tz_aware, uuid_subtype, compile_re):
     result = as_class()
     position = 0
     end = len(data) - 1
     while position < end:
-        (key, value, position) = _element_to_dict(data, position, as_class,
-                                                  tz_aware, uuid_subtype)
+        (key, value, position) = _element_to_dict(
+            data, position, as_class, tz_aware, uuid_subtype, compile_re)
         result[key] = value
     return result
 
-def _bson_to_dict(data, as_class, tz_aware, uuid_subtype):
+def _bson_to_dict(data, as_class, tz_aware, uuid_subtype, compile_re):
     obj_size = struct.unpack("<i", data[:4])[0]
     length = len(data)
     if length < obj_size:
@@ -338,8 +340,10 @@ def _bson_to_dict(data, as_class, tz_aware, uuid_subtype):
     if obj_size != length or data[obj_size - 1:obj_size] != ZERO:
         raise InvalidBSON("bad eoo")
     elements = data[4:obj_size - 1]
-    return (_elements_to_dict(elements, as_class,
-                              tz_aware, uuid_subtype), data[obj_size:])
+    dct = _elements_to_dict(
+        elements, as_class, tz_aware, uuid_subtype, compile_re)
+
+    return dct, data[obj_size:]
 if _use_c:
     _bson_to_dict = _cbson._bson_to_dict
 
@@ -441,7 +445,7 @@ def _element_to_bson(key, value, check_keys, uuid_subtype):
         return BSONTIM + name + inc + time
     if value is None:
         return BSONNUL + name
-    if isinstance(value, RE_TYPE):
+    if isinstance(value, (RE_TYPE, Regex)):
         pattern = value.pattern
         flags = ""
         if value.flags & re.IGNORECASE:
@@ -473,10 +477,12 @@ def _dict_to_bson(dict, check_keys, uuid_subtype, top_level=True):
     try:
         elements = []
         if top_level and "_id" in dict:
-            elements.append(_element_to_bson("_id", dict["_id"], False, uuid_subtype))
+            elements.append(_element_to_bson("_id", dict["_id"],
+                                             check_keys, uuid_subtype))
         for (key, value) in dict.iteritems():
             if not top_level or key != "_id":
-                elements.append(_element_to_bson(key, value, check_keys, uuid_subtype))
+                elements.append(_element_to_bson(key, value,
+                                                 check_keys, uuid_subtype))
     except AttributeError:
         raise TypeError("encoder expected a mapping type but got: %r" % dict)
 
@@ -489,7 +495,7 @@ if _use_c:
 
 
 def decode_all(data, as_class=dict,
-               tz_aware=True, uuid_subtype=OLD_UUID_SUBTYPE):
+               tz_aware=True, uuid_subtype=OLD_UUID_SUBTYPE, compile_re=True):
     """Decode BSON data to multiple documents.
 
     `data` must be a string of concatenated, valid, BSON-encoded
@@ -501,23 +507,37 @@ def decode_all(data, as_class=dict,
         documents
       - `tz_aware` (optional): if ``True``, return timezone-aware
         :class:`~datetime.datetime` instances
+      - `compile_re` (optional): if ``False``, don't attempt to compile
+        BSON regular expressions into Python regular expressions. Return
+        instances of :class:`~bson.regex.Regex` instead. Can avoid
+        :exc:`~bson.errors.InvalidBSON` errors when receiving
+        Python-incompatible regular expressions, for example from ``currentOp``
 
+    .. versionchanged:: 2.7
+       Added `compile_re` option.
     .. versionadded:: 1.9
     """
     docs = []
     position = 0
     end = len(data) - 1
-    while position < end:
-        obj_size = struct.unpack("<i", data[position:position + 4])[0]
-        if len(data) - position < obj_size:
-            raise InvalidBSON("objsize too large")
-        if data[position + obj_size - 1:position + obj_size] != ZERO:
-            raise InvalidBSON("bad eoo")
-        elements = data[position + 4:position + obj_size - 1]
-        position += obj_size
-        docs.append(_elements_to_dict(elements, as_class,
-                                      tz_aware, uuid_subtype))
-    return docs
+    try:
+        while position < end:
+            obj_size = struct.unpack("<i", data[position:position + 4])[0]
+            if len(data) - position < obj_size:
+                raise InvalidBSON("objsize too large")
+            if data[position + obj_size - 1:position + obj_size] != ZERO:
+                raise InvalidBSON("bad eoo")
+            elements = data[position + 4:position + obj_size - 1]
+            position += obj_size
+            docs.append(_elements_to_dict(elements, as_class,
+                                          tz_aware, uuid_subtype, compile_re))
+        return docs
+    except InvalidBSON:
+        raise
+    except Exception:
+        # Change exception type to InvalidBSON but preserve traceback.
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        raise InvalidBSON, str(exc_value), exc_tb
 if _use_c:
     decode_all = _cbson.decode_all
 
@@ -537,7 +557,7 @@ def is_valid(bson):
                         "of a subclass of %s" % (binary_type.__name__,))
 
     try:
-        (_, remainder) = _bson_to_dict(bson, dict, True, OLD_UUID_SUBTYPE)
+        (_, remainder) = _bson_to_dict(bson, dict, True, OLD_UUID_SUBTYPE, True)
         return remainder == EMPTY
     except:
         return False
@@ -570,7 +590,7 @@ class BSON(binary_type):
         return cls(_dict_to_bson(document, check_keys, uuid_subtype))
 
     def decode(self, as_class=dict,
-               tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE):
+               tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE, compile_re=True):
         """Decode this BSON data.
 
         The default type to use for the resultant document is
@@ -590,10 +610,21 @@ class BSON(binary_type):
             document
           - `tz_aware` (optional): if ``True``, return timezone-aware
             :class:`~datetime.datetime` instances
+          - `compile_re` (optional): if ``False``, don't attempt to compile
+            BSON regular expressions into Python regular expressions. Return
+            instances of
+            :class:`~bson.regex.Regex` instead. Can avoid
+            :exc:`~bson.errors.InvalidBSON` errors when receiving
+            Python-incompatible regular expressions, for example from
+            ``currentOp``
 
+        .. versionchanged:: 2.7
+           Added ``compile_re`` option.
         .. versionadded:: 1.9
         """
-        (document, _) = _bson_to_dict(self, as_class, tz_aware, uuid_subtype)
+        (document, _) = _bson_to_dict(
+            self, as_class, tz_aware, uuid_subtype, compile_re)
+
         return document
 
 

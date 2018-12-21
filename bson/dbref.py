@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,9 @@ from bson.son import SON
 class DBRef(object):
     """A reference to a document stored in MongoDB.
     """
+
+    # DBRef isn't actually a BSON "type" so this number was arbitrarily chosen.
+    _type_marker = 100
 
     def __init__(self, collection, id, database=None, _extra={}, **kwargs):
         """Initialize a new :class:`DBRef`.

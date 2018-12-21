@@ -16,10 +16,13 @@ MongoDB, you can start it like so:
 .. toctree::
    :maxdepth: 1
 
-   gridfs
    aggregation
-   geo
-   high_availability
+   authentication
+   bulk
    custom_type
+   geo
    gevent
+   gridfs
+   high_availability
+   mod_wsgi
    requests

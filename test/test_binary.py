@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,14 +33,10 @@ from bson.binary import *
 from bson.py3compat import b, binary_type
 from bson.son import SON
 from nose.plugins.skip import SkipTest
-from test.test_connection import get_connection
-
+from test.test_client import get_client
+from pymongo.mongo_client import MongoClient
 
 class TestBinary(unittest.TestCase):
-
-    def setUp(self):
-        pass
-
     def test_binary(self):
         a_string = "hello world"
         a_binary = Binary(b("hello world"))
@@ -157,12 +153,12 @@ class TestBinary(unittest.TestCase):
         self.assertEqual(data, encoded)
 
         # Test insert and find
-        conn = get_connection()
-        conn.pymongo_test.drop_collection('java_uuid')
-        coll = conn.pymongo_test.java_uuid
+        client = get_client()
+        client.pymongo_test.drop_collection('java_uuid')
+        coll = client.pymongo_test.java_uuid
         coll.uuid_subtype = JAVA_LEGACY
 
-        coll.insert(docs, safe=True)
+        coll.insert(docs)
         self.assertEqual(5, coll.count())
         for d in coll.find():
             self.assertEqual(d['newguid'], uuid.UUID(d['newguidstring']))
@@ -170,7 +166,7 @@ class TestBinary(unittest.TestCase):
         coll.uuid_subtype = OLD_UUID_SUBTYPE
         for d in coll.find():
             self.assertNotEqual(d['newguid'], d['newguidstring'])
-        conn.pymongo_test.drop_collection('java_uuid')
+        client.pymongo_test.drop_collection('java_uuid')
 
     def test_legacy_csharp_uuid(self):
         if not should_test_uuid:
@@ -229,12 +225,12 @@ class TestBinary(unittest.TestCase):
         self.assertEqual(data, encoded)
 
         # Test insert and find
-        conn = get_connection()
-        conn.pymongo_test.drop_collection('csharp_uuid')
-        coll = conn.pymongo_test.csharp_uuid
+        client = get_client()
+        client.pymongo_test.drop_collection('csharp_uuid')
+        coll = client.pymongo_test.csharp_uuid
         coll.uuid_subtype = CSHARP_LEGACY
 
-        coll.insert(docs, safe=True)
+        coll.insert(docs)
         self.assertEqual(5, coll.count())
         for d in coll.find():
             self.assertEqual(d['newguid'], uuid.UUID(d['newguidstring']))
@@ -242,13 +238,21 @@ class TestBinary(unittest.TestCase):
         coll.uuid_subtype = OLD_UUID_SUBTYPE
         for d in coll.find():
             self.assertNotEqual(d['newguid'], d['newguidstring'])
-        conn.pymongo_test.drop_collection('csharp_uuid')
+        client.pymongo_test.drop_collection('csharp_uuid')
+
+    def test_uri_to_uuid(self):
+        if not should_test_uuid:
+            raise SkipTest("No uuid module")
+
+        uri = "mongodb://foo/?uuidrepresentation=csharpLegacy"
+        client = MongoClient(uri, _connect=False)
+        self.assertEqual(client.pymongo_test.test.uuid_subtype, CSHARP_LEGACY)
 
     def test_uuid_queries(self):
         if not should_test_uuid:
             raise SkipTest("No uuid module")
 
-        c = get_connection()
+        c = get_client()
         coll = c.pymongo_test.test
         coll.drop()
 
@@ -307,6 +311,7 @@ class TestBinary(unittest.TestCase):
 
             for proto in xrange(pickle.HIGHEST_PROTOCOL + 1):
                 self.assertEqual(uul, pickle.loads(pickle.dumps(uul, proto)))
+
 
 if __name__ == "__main__":
     unittest.main()

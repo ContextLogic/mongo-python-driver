@@ -1,6 +1,234 @@
 Changelog
 =========
 
+Changes in Version 2.7.2
+------------------------
+
+Version 2.7.2 includes fixes for upsert reporting in the bulk API for MongoDB
+versions previous to 2.6, a regression in how son manipulators are applied in
+:meth:`~pymongo.collection.Collection.insert`, a few obscure connection pool
+semaphore leaks, and a few other minor issues. See the list of issues resolved
+for full details.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.7.2 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.7.2 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/14005
+
+Changes in Version 2.7.1
+------------------------
+
+Version 2.7.1 fixes a number of issues reported since the release of 2.7,
+most importantly a fix for creating indexes and manipulating users through
+mongos versions older than 2.4.0.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.7.1 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.7.1 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/13823
+
+Changes in Version 2.7
+----------------------
+
+PyMongo 2.7 is a major release with a large number of new features and bug
+fixes. Highlights include:
+
+- Full support for MongoDB 2.6.
+- A new :doc:`bulk write operations API </examples/bulk>`.
+- Support for server side query timeouts using
+  :meth:`~pymongo.cursor.Cursor.max_time_ms`.
+- Support for writing :meth:`~pymongo.collection.Collection.aggregate`
+  output to a collection.
+- A new :meth:`~pymongo.collection.Collection.parallel_scan` helper.
+- :class:`~pymongo.errors.OperationFailure` and its subclasses now include
+  a :attr:`~pymongo.errors.OperationFailure.details` attribute with complete
+  error details from the server.
+- A new GridFS :meth:`~gridfs.GridFS.find` method that returns a
+  :class:`~gridfs.grid_file.GridOutCursor`.
+- Greatly improved :doc:`support for mod_wsgi </examples/mod_wsgi>` when using
+  PyMongo's C extensions. Read `Jesse's blog post
+  <http://emptysqua.re/blog/python-c-extensions-and-mod-wsgi/>`_ for details.
+- Improved C extension support for ARM little endian.
+
+Breaking changes
+................
+
+Version 2.7 drops support for replica sets running MongoDB versions older
+than 1.6.2.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.7 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.7 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/12892
+
+Changes in Version 2.6.3
+------------------------
+
+Version 2.6.3 fixes issues reported since the release of 2.6.2, most
+importantly a semaphore leak when a connection to the server fails.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.6.3 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.6.3 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/13098
+
+Changes in Version 2.6.2
+------------------------
+
+Version 2.6.2 fixes a :exc:`TypeError` problem when max_pool_size=None
+is used in Python 3.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.6.2 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.6.2 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/12910
+
+Changes in Version 2.6.1
+------------------------
+
+Version 2.6.1 fixes a reference leak in
+the :meth:`~pymongo.collection.Collection.insert` method.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.6.1 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.6.1 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/12905
+
+Changes in Version 2.6
+----------------------
+
+Version 2.6 includes some frequently requested improvements and adds
+support for some early MongoDB 2.6 features.
+
+Special thanks go to Justin Patrin for his work on the connection pool
+in this release.
+
+Important new features:
+
+- The ``max_pool_size`` option for :class:`~pymongo.mongo_client.MongoClient`
+  and :class:`~pymongo.mongo_replica_set_client.MongoReplicaSetClient` now
+  actually caps the number of sockets the pool will open concurrently.
+  Once the pool has reached :attr:`~pymongo.mongo_client.MongoClient.max_pool_size`
+  operations will block waiting for a socket to become available. If
+  ``waitQueueTimeoutMS`` is set, an operation that blocks waiting for a socket
+  will raise :exc:`~pymongo.errors.ConnectionFailure` after the timeout. By
+  default ``waitQueueTimeoutMS`` is not set.
+  See :ref:`connection-pooling` for more information.
+- The :meth:`~pymongo.collection.Collection.insert` method automatically splits
+  large batches of documents into multiple insert messages based on
+  :attr:`~pymongo.mongo_client.MongoClient.max_message_size`
+- Support for the exhaust cursor flag.
+  See :meth:`~pymongo.collection.Collection.find` for details and caveats.
+- Support for the PLAIN and MONGODB-X509 authentication mechanisms.
+  See :doc:`the authentication docs </examples/authentication>` for more
+  information.
+- Support aggregation output as a :class:`~pymongo.cursor.Cursor`. See
+  :meth:`~pymongo.collection.Collection.aggregate` for details.
+
+.. warning:: SIGNIFICANT BEHAVIOR CHANGE in 2.6. Previously, `max_pool_size`
+  would limit only the idle sockets the pool would hold onto, not the
+  number of open sockets. The default has also changed, from 10 to 100.
+  If you pass a value for ``max_pool_size`` make sure it is large enough for
+  the expected load. (Sockets are only opened when needed, so there is no cost
+  to having a ``max_pool_size`` larger than necessary. Err towards a larger
+  value.) If your application accepts the default, continue to do so.
+
+  See :ref:`connection-pooling` for more information.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.6 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.6 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/12380
+
+Changes in Version 2.5.2
+------------------------
+
+Version 2.5.2 fixes a NULL pointer dereference issue when decoding
+an invalid :class:`~bson.dbref.DBRef`.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.5.2 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.5.2 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/12581
+
+Changes in Version 2.5.1
+------------------------
+
+Version 2.5.1 is a minor release that fixes issues discovered after the
+release of 2.5. Most importantly, this release addresses some race
+conditions in replica set monitoring.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.5.1 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.5.1 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/12484
+
+Changes in Version 2.5
+----------------------
+
+Version 2.5 includes changes to support new features in MongoDB 2.4.
+
+Important new features:
+
+- Support for :ref:`GSSAPI (Kerberos) authentication <use_kerberos>`.
+- Support for SSL certificate validation with hostname matching.
+- Support for delegated and role based authentication.
+- New GEOSPHERE (2dsphere) and HASHED index constants.
+
+.. note:: :meth:`~pymongo.database.Database.authenticate` now raises a
+    subclass of :class:`~pymongo.errors.PyMongoError` if authentication
+    fails due to invalid credentials or configuration issues.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.5 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.5 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/11981
+
+Changes in Version 2.4.2
+------------------------
+
+Version 2.4.2 is a minor release that fixes issues discovered after the
+release of 2.4.1. Most importantly, PyMongo will no longer select a replica
+set member for read operations that is not in primary or secondary state.
+
+Issues Resolved
+...............
+
+See the `PyMongo 2.4.2 release notes in JIRA`_ for the list of resolved issues
+in this release.
+
+.. _PyMongo 2.4.2 release notes in JIRA: https://jira.mongodb.org/browse/PYTHON/fixforversion/12299
+
 Changes in Version 2.4.1
 ------------------------
 

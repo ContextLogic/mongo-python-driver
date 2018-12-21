@@ -1,5 +1,5 @@
 /*
- * Copyright 2009-2012 10gen, Inc.
+ * Copyright 2009-2014 MongoDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -139,4 +139,8 @@ int buffer_get_position(buffer_t buffer) {
 
 char* buffer_get_buffer(buffer_t buffer) {
     return buffer->buffer;
+}
+
+void buffer_update_position(buffer_t buffer, buffer_position new_position) {
+    buffer->position = new_position;
 }

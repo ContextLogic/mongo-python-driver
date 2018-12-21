@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@ slaves. Reads are tried on each slave in turn until the read succeeds
 or all slaves failed.
 """
 
-from pymongo import helpers
+from pymongo import helpers, thread_util
 from pymongo import ReadPreference
 from pymongo.common import BaseObject
-from pymongo.connection import Connection
+from pymongo.mongo_client import MongoClient
 from pymongo.database import Database
 from pymongo.errors import AutoReconnect
 
@@ -35,19 +35,20 @@ class MasterSlaveConnection(BaseObject):
         """Create a new Master-Slave connection.
 
         The resultant connection should be interacted with using the same
-        mechanisms as a regular `Connection`. The `Connection` instances used
+        mechanisms as a regular `MongoClient`. The `MongoClient` instances used
         to create this `MasterSlaveConnection` can themselves make use of
-        connection pooling, etc. 'Connection' instances used as slaves should
+        connection pooling, etc. `MongoClient` instances used as slaves should
         be created with the read_preference option set to
-        :attr:`~pymongo.read_preferences.ReadPreference.SECONDARY`. Safe
-        options are inherited from `master` and can be changed in this instance.
+        :attr:`~pymongo.read_preferences.ReadPreference.SECONDARY`. Write
+        concerns are inherited from `master` and can be changed in this
+        instance.
 
-        Raises TypeError if `master` is not an instance of `Connection` or
-        slaves is not a list of at least one `Connection` instances.
+        Raises TypeError if `master` is not an instance of `MongoClient` or
+        slaves is not a list of at least one `MongoClient` instances.
 
         :Parameters:
-          - `master`: `Connection` instance for the writable Master
-          - `slaves` (optional): list of `Connection` instances for the
+          - `master`: `MongoClient` instance for the writable Master
+          - `slaves`: list of `MongoClient` instances for the
             read-only slaves
           - `document_class` (optional): default class to use for
             documents returned from queries on this connection
@@ -56,26 +57,26 @@ class MasterSlaveConnection(BaseObject):
             in a document by this :class:`MasterSlaveConnection` will be timezone
             aware (otherwise they will be naive)
         """
-        if not isinstance(master, Connection):
-            raise TypeError("master must be a Connection instance")
+        if not isinstance(master, MongoClient):
+            raise TypeError("master must be a MongoClient instance")
         if not isinstance(slaves, list) or len(slaves) == 0:
             raise TypeError("slaves must be a list of length >= 1")
 
         for slave in slaves:
-            if not isinstance(slave, Connection):
-                raise TypeError("slave %r is not an instance of Connection" %
+            if not isinstance(slave, MongoClient):
+                raise TypeError("slave %r is not an instance of MongoClient" %
                                 slave)
 
         super(MasterSlaveConnection,
               self).__init__(read_preference=ReadPreference.SECONDARY,
                              safe=master.safe,
-                             **(master.get_lasterror_options()))
+                             **master.write_concern)
 
-        self.__in_request = False
         self.__master = master
         self.__slaves = slaves
         self.__document_class = document_class
         self.__tz_aware = tz_aware
+        self.__request_counter = thread_util.Counter(master.use_greenlets)
 
     @property
     def master(self):
@@ -93,6 +94,15 @@ class MasterSlaveConnection(BaseObject):
         """
         return False
 
+    @property
+    def use_greenlets(self):
+        """Whether calling :meth:`start_request` assigns greenlet-local,
+        rather than thread-local, sockets.
+
+        .. versionadded:: 2.4.2
+        """
+        return self.master.use_greenlets
+
     def get_document_class(self):
         return self.__document_class
 
@@ -107,13 +117,62 @@ class MasterSlaveConnection(BaseObject):
     def tz_aware(self):
         return self.__tz_aware
 
+    @property
+    def max_bson_size(self):
+        """Return the maximum size BSON object the connected master
+        accepts in bytes. Defaults to 4MB in server < 1.7.4.
+
+        .. versionadded:: 2.6
+        """
+        return self.master.max_bson_size
+
+    @property
+    def max_message_size(self):
+        """Return the maximum message size the connected master
+        accepts in bytes.
+
+        .. versionadded:: 2.6
+        """
+        return self.master.max_message_size
+
+    @property
+    def min_wire_version(self):
+        """The minWireVersion reported by the server.
+
+        Returns ``0`` when connected to server versions prior to MongoDB 2.6.
+
+        .. versionadded:: 2.7
+        """
+        return self.master.min_wire_version
+
+    @property
+    def max_wire_version(self):
+        """The maxWireVersion reported by the server.
+
+        Returns ``0`` when connected to server versions prior to MongoDB 2.6.
+
+        .. versionadded:: 2.7
+        """
+        return self.master.max_wire_version
+
+    @property
+    def max_write_batch_size(self):
+        """The maxWriteBatchSize reported by the server.
+
+        Returns a default value when connected to server versions prior to
+        MongoDB 2.6.
+
+        .. versionadded:: 2.7
+        """
+        return self.master.max_write_batch_size
+
     def disconnect(self):
         """Disconnect from MongoDB.
 
         Disconnecting will call disconnect on all master and slave
         connections.
 
-        .. seealso:: Module :mod:`~pymongo.connection`
+        .. seealso:: Module :mod:`~pymongo.mongo_client`
         .. versionadded:: 1.10.1
         """
         self.__master.disconnect()
@@ -123,18 +182,24 @@ class MasterSlaveConnection(BaseObject):
     def set_cursor_manager(self, manager_class):
         """Set the cursor manager for this connection.
 
-        Helper to set cursor manager for each individual `Connection` instance
+        Helper to set cursor manager for each individual `MongoClient` instance
         that make up this `MasterSlaveConnection`.
         """
         self.__master.set_cursor_manager(manager_class)
         for slave in self.__slaves:
             slave.set_cursor_manager(manager_class)
 
+    def _ensure_connected(self, sync):
+        """Ensure the master is connected to a mongod/s.
+        """
+        self.__master._ensure_connected(sync)
+
     # _connection_to_use is a hack that we need to include to make sure
     # that killcursor operations can be sent to the same instance on which
     # the cursor actually resides...
     def _send_message(self, message,
-                      with_last_error=False, _connection_to_use=None):
+                      with_last_error=False,
+                      command=False, _connection_to_use=None):
         """Say something to Mongo.
 
         Sends a message on the Master connection. This is used for inserts,
@@ -149,9 +214,10 @@ class MasterSlaveConnection(BaseObject):
           - `safe`: perform a getLastError after sending the message
         """
         if _connection_to_use is None or _connection_to_use == -1:
-            return self.__master._send_message(message, with_last_error)
+            return self.__master._send_message(message,
+                                               with_last_error, command)
         return self.__slaves[_connection_to_use]._send_message(
-            message, with_last_error, check_primary=False)
+            message, with_last_error, command, check_primary=False)
 
     # _connection_to_use is a hack that we need to include to make sure
     # that getmore operations can be sent to the same instance on which
@@ -168,20 +234,20 @@ class MasterSlaveConnection(BaseObject):
         """
         if _connection_to_use is not None:
             if _connection_to_use == -1:
-                return (-1,
-                         self.__master._send_message_with_response(message,
-                                                                   **kwargs))
+                member = self.__master
+                conn = -1
             else:
-                return (_connection_to_use,
-                        self.__slaves[_connection_to_use]
-                        ._send_message_with_response(message, **kwargs))
+                member = self.__slaves[_connection_to_use]
+                conn = _connection_to_use
+            return (conn,
+                    member._send_message_with_response(message, **kwargs)[1])
 
         # _must_use_master is set for commands, which must be sent to the
         # master instance. any queries in a request must be sent to the
         # master since that is where writes go.
-        if _must_use_master or self.__in_request:
+        if _must_use_master or self.in_request():
             return (-1, self.__master._send_message_with_response(message,
-                                                                  **kwargs))
+                                                                  **kwargs)[1])
 
         # Iterate through the slaves randomly until we have success. Raise
         # reconnect if they all fail.
@@ -189,7 +255,8 @@ class MasterSlaveConnection(BaseObject):
             try:
                 slave = self.__slaves[connection_id]
                 return (connection_id,
-                        slave._send_message_with_response(message, **kwargs))
+                        slave._send_message_with_response(message,
+                                                          **kwargs)[1])
             except AutoReconnect:
                 pass
 
@@ -202,16 +269,19 @@ class MasterSlaveConnection(BaseObject):
         that all operations performed within a request will be sent
         using the Master connection.
         """
+        self.__request_counter.inc()
         self.master.start_request()
-        self.__in_request = True
+
+    def in_request(self):
+        return bool(self.__request_counter.get())
 
     def end_request(self):
         """End the current "request".
 
-        See documentation for `Connection.end_request`.
+        See documentation for `MongoClient.end_request`.
         """
-        self.__in_request = False
-        self.__master.end_request()
+        self.__request_counter.dec()
+        self.master.end_request()
 
     def __eq__(self, other):
         if isinstance(other, MasterSlaveConnection):
@@ -255,7 +325,7 @@ class MasterSlaveConnection(BaseObject):
 
         :Parameters:
           - `cursor_id`: cursor id to close
-          - `connection_id`: id of the `Connection` instance where the cursor
+          - `connection_id`: id of the `MongoClient` instance where the cursor
             was opened
         """
         if connection_id == -1:

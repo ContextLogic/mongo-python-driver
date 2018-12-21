@@ -1,4 +1,4 @@
-# Copyright 2011-2012 10gen, Inc.
+# Copyright 2011-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you
 # may not use this file except in compliance with the License.  You
@@ -21,6 +21,7 @@ from pymongo.common import validate
 from pymongo.errors import (ConfigurationError,
                             InvalidURI,
                             UnsupportedOption)
+
 
 SCHEME = 'mongodb://'
 SCHEME_LEN = len(SCHEME)
@@ -78,9 +79,9 @@ def parse_userinfo(userinfo):
         raise InvalidURI("':' or '@' characters in a username or password "
                          "must be escaped according to RFC 2396.")
     user, _, passwd = _partition(userinfo, ":")
-    if not user or not passwd:
-        raise InvalidURI("An empty string is not a "
-                         "valid username or password.")
+    # No password is expected with GSSAPI authentication.
+    if not user:
+        raise InvalidURI("The empty string is not valid username.")
     user = unquote_plus(user)
     passwd = unquote_plus(passwd)
 
@@ -150,8 +151,37 @@ def validate_options(opts):
     normalized = {}
     for option, value in opts.iteritems():
         option, value = validate(option, value)
-        normalized[option] = value
+        # str(option) to ensure that a unicode URI results in plain 'str'
+        # option names. 'normalized' is then suitable to be passed as kwargs
+        # in all Python versions.
+        normalized[str(option)] = value
     return normalized
+
+
+def _parse_options(opts, delim):
+    """Helper method for split_options which creates the options dict.
+    Also handles the creation of a list of dicts for the URI tag_sets/
+    readpreferencetags portion."""
+    options = {}
+    for opt in opts.split(delim):
+        key, val = opt.split("=")
+        if key.lower() == 'readpreferencetags':
+            options.setdefault('readpreferencetags', []).append(val)
+        else:
+            options[key] = val
+    if 'readpreferencetags' in options:
+        new_tag_sets = []
+        for tag_set in options['readpreferencetags']:
+            tag_dict = {}
+            try:
+                for tag in tag_set.split(","):
+                    tag_parts = tag.split(":")
+                    tag_dict[tag_parts[0]] = tag_parts[1]
+                new_tag_sets.append(tag_dict)
+            except IndexError:
+                new_tag_sets.append({})
+        options['readpreferencetags'] = new_tag_sets
+    return options
 
 
 def split_options(opts):
@@ -168,11 +198,11 @@ def split_options(opts):
         if and_idx >= 0 and semi_idx >= 0:
             raise InvalidURI("Can not mix '&' and ';' for option separators.")
         elif and_idx >= 0:
-            options = dict([kv.split("=") for kv in opts.split("&")])
+            options = _parse_options(opts, "&")
         elif semi_idx >= 0:
-            options = dict([kv.split("=") for kv in opts.split(";")])
+            options = _parse_options(opts, ";")
         elif opts.find("=") != -1:
-            options = dict([opts.split("=")])
+            options = _parse_options(opts, None)
         else:
             raise ValueError
     except ValueError:
@@ -295,4 +325,3 @@ if __name__ == '__main__':
     except (InvalidURI, UnsupportedOption), e:
         print e
     sys.exit(0)
-

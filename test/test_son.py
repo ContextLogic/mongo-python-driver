@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,11 @@
 
 """Tests for the son module."""
 
-import unittest
-import sys
+import copy
 import pickle
+import re
+import sys
+import unittest
 sys.path[0:0] = [""]
 
 from nose.plugins.skip import SkipTest
@@ -26,10 +28,6 @@ from bson.son import SON
 
 
 class TestSON(unittest.TestCase):
-
-    def setUp(self):
-        pass
-
     def test_ordered_dict(self):
         a1 = SON()
         a1["hello"] = "world"
@@ -69,6 +67,15 @@ class TestSON(unittest.TestCase):
                                      ('mike', 'awesome'),
                                      ('hello', 'world'))))
 
+        # Embedded SON.
+        d4 = SON([('blah', {'foo': SON()})])
+        self.assertEqual(d4, {'blah': {'foo': {}}})
+        self.assertEqual(d4, {'blah': {'foo': SON()}})
+        self.assertNotEqual(d4, {'blah': {'foo': []}})
+
+        # Original data unaffected.
+        self.assertEqual(SON, d4['blah']['foo'].__class__)
+
     def test_to_dict(self):
         a1 = SON()
         b2 = SON([("blah", SON())])
@@ -82,6 +89,9 @@ class TestSON(unittest.TestCase):
         self.assertEqual(dict, b2.to_dict()["blah"].__class__)
         self.assertEqual(dict, c3.to_dict()["blah"][0].__class__)
         self.assertEqual(dict, d4.to_dict()["blah"]["foo"].__class__)
+
+        # Original data unaffected.
+        self.assertEqual(SON, d4['blah']['foo'].__class__)
 
     def test_pickle(self):
 
@@ -110,6 +120,41 @@ class TestSON(unittest.TestCase):
         )
         son_2_1_1 = pickle.loads(pickled_with_2_1_1)
         self.assertEqual(son_2_1_1, SON([]))
+
+    def test_copying(self):
+        simple_son = SON([])
+        complex_son = SON([('son', simple_son),
+                           ('list', [simple_son, simple_son])])
+        regex_son = SON([("x", re.compile("^hello.*"))])
+        reflexive_son = SON([('son', simple_son)])
+        reflexive_son["reflexive"] = reflexive_son
+
+        simple_son1 = copy.copy(simple_son)
+        self.assertEqual(simple_son, simple_son1)
+
+        complex_son1 = copy.copy(complex_son)
+        self.assertEqual(complex_son, complex_son1)
+
+        regex_son1 = copy.copy(regex_son)
+        self.assertEqual(regex_son, regex_son1)
+
+        reflexive_son1 = copy.copy(reflexive_son)
+        self.assertEqual(reflexive_son, reflexive_son1)
+
+        # Test deepcopying
+        simple_son1 = copy.deepcopy(simple_son)
+        self.assertEqual(simple_son, simple_son1)
+
+        regex_son1 = copy.deepcopy(regex_son)
+        self.assertEqual(regex_son, regex_son1)
+
+        complex_son1 = copy.deepcopy(complex_son)
+        self.assertEqual(complex_son, complex_son1)
+
+        reflexive_son1 = copy.deepcopy(reflexive_son)
+        self.assertEqual(reflexive_son.keys(), reflexive_son1.keys())
+        self.assertEqual(id(reflexive_son1), id(reflexive_son1["reflexive"]))
+
 
 if __name__ == "__main__":
     unittest.main()

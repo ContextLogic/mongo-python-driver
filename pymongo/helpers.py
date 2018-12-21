@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,6 @@
 
 """Bits and pieces used by the driver that don't really fit elsewhere."""
 
-try:
-    import hashlib
-    _md5func = hashlib.md5
-except:  # for Python < 2.5
-    import md5
-    _md5func = md5.new
 import random
 import struct
 
@@ -29,8 +23,11 @@ import pymongo
 from bson.binary import OLD_UUID_SUBTYPE
 from bson.son import SON
 from pymongo.errors import (AutoReconnect,
+                            CursorNotFound,
+                            DuplicateKeyError,
                             OperationFailure,
-                            TimeoutError)
+                            ExecutionTimeout,
+                            WTimeoutError)
 
 
 def _index_list(key_or_list, direction=None):
@@ -43,7 +40,7 @@ def _index_list(key_or_list, direction=None):
     else:
         if isinstance(key_or_list, basestring):
             return [(key_or_list, pymongo.ASCENDING)]
-        elif not isinstance(key_or_list, list):
+        elif not isinstance(key_or_list, (list, tuple)):
             raise TypeError("if no direction is specified, "
                             "key_or_list must be an instance of list")
         return key_or_list
@@ -58,7 +55,7 @@ def _index_document(index_list):
         raise TypeError("passing a dict to sort/create_index/hint is not "
                         "allowed - use a list of tuples instead. did you "
                         "mean %r?" % list(index_list.iteritems()))
-    elif not isinstance(index_list, list):
+    elif not isinstance(index_list, (list, tuple)):
         raise TypeError("must use a list of (key, direction) pairs, "
                         "not: " + repr(index_list))
     if not len(index_list):
@@ -68,16 +65,17 @@ def _index_document(index_list):
     for (key, value) in index_list:
         if not isinstance(key, basestring):
             raise TypeError("first item in each key pair must be a string")
-        if not isinstance(value, (basestring, int)):
-            raise TypeError("second item in each key pair must be ASCENDING, "
-                            "DESCENDING, GEO2D, GEOHAYSTACK, TEXT, or other "
-                            "valid MongoDB index specifier.")
+        if not isinstance(value, (basestring, int, dict)):
+            raise TypeError("second item in each key pair must be 1, -1, "
+                            "'2d', 'geoHaystack', or another valid MongoDB "
+                            "index specifier.")
         index[key] = value
     return index
 
 
-def _unpack_response(response, cursor_id=None,
-                     as_class=dict, tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE):
+def _unpack_response(response, cursor_id=None, as_class=dict,
+                     tz_aware=False, uuid_subtype=OLD_UUID_SUBTYPE,
+                     compile_re=True):
     """Unpack a response from the database.
 
     Check the response for errors and unpack, returning a dictionary
@@ -95,30 +93,50 @@ def _unpack_response(response, cursor_id=None,
         # Shouldn't get this response if we aren't doing a getMore
         assert cursor_id is not None
 
-        raise OperationFailure("cursor id '%s' not valid at server" %
-                               cursor_id)
+        raise CursorNotFound("cursor id '%s' not valid at server" %
+                             cursor_id)
     elif response_flag & 2:
         error_object = bson.BSON(response[20:]).decode()
         if error_object["$err"].startswith("not master"):
             raise AutoReconnect(error_object["$err"])
+        elif error_object.get("code") == 50:
+            raise ExecutionTimeout(error_object.get("$err"),
+                                   error_object.get("code"),
+                                   error_object)
         raise OperationFailure("database error: %s" %
-                               error_object["$err"])
+                               error_object.get("$err"),
+                               error_object.get("code"),
+                               error_object)
 
     result = {}
     result["cursor_id"] = struct.unpack("<q", response[4:12])[0]
     result["starting_from"] = struct.unpack("<i", response[12:16])[0]
     result["number_returned"] = struct.unpack("<i", response[16:20])[0]
     result["data"] = bson.decode_all(response[20:],
-                                     as_class, tz_aware, uuid_subtype)
+                                     as_class, tz_aware, uuid_subtype,
+                                     compile_re)
     assert len(result["data"]) == result["number_returned"]
     return result
 
 
-def _check_command_response(response, reset, msg="%s", allowable_errors=[]):
+def _check_command_response(response, reset, msg=None, allowable_errors=None):
+    """Check the response to a command for errors.
+    """
+    if "ok" not in response:
+        # Server didn't recognize our message as a command.
+        raise OperationFailure(response.get("$err"),
+                               response.get("code"),
+                               response)
+
+    if response.get("wtimeout", False):
+        # MongoDB versions before 1.8.0 return the error message in an "errmsg"
+        # field. If "errmsg" exists "err" will also exist set to None, so we
+        # have to check for "errmsg" first.
+        raise WTimeoutError(response.get("errmsg", response.get("err")),
+                            response.get("code"),
+                            response)
 
     if not response["ok"]:
-        if "wtimeout" in response and response["wtimeout"]:
-            raise TimeoutError(msg % response["errmsg"])
 
         details = response
         # Mongos returns the error details in a 'raw' object
@@ -131,48 +149,60 @@ def _check_command_response(response, reset, msg="%s", allowable_errors=[]):
                     break
 
         errmsg = details["errmsg"]
-        if not errmsg in allowable_errors:
+        if allowable_errors is None or errmsg not in allowable_errors:
+
+            # Server is "not master" or "recovering"
             if (errmsg.startswith("not master")
                 or errmsg.startswith("node is recovering")):
                 if reset is not None:
                     reset()
                 raise AutoReconnect(errmsg)
+
+            # Server assertion failures
             if errmsg == "db assertion failure":
-                ex_msg = ("db assertion failure, assertion: '%s'" %
+                errmsg = ("db assertion failure, assertion: '%s'" %
                           details.get("assertion", ""))
-                if "assertionCode" in details:
-                    ex_msg += (", assertionCode: %d" %
-                               (details["assertionCode"],))
-                raise OperationFailure(ex_msg, details.get("assertionCode"))
-            raise OperationFailure(msg % errmsg)
+                raise OperationFailure(errmsg,
+                                       details.get("assertionCode"),
+                                       response)
+
+            # Other errors
+            code = details.get("code")
+            # findAndModify with upsert can raise duplicate key error
+            if code in (11000, 11001, 12582):
+                raise DuplicateKeyError(errmsg, code, response)
+            elif code == 50:
+                raise ExecutionTimeout(errmsg, code, response)
+
+            msg = msg or "%s"
+            raise OperationFailure(msg % errmsg, code, response)
 
 
-def _password_digest(username, password):
-    """Get a password digest to use for authentication.
+def _check_write_command_response(results):
+    """Backward compatibility helper for write command error handling.
     """
-    if not isinstance(password, basestring):
-        raise TypeError("password must be an instance "
-                        "of %s" % (basestring.__name__,))
-    if len(password) == 0:
-        raise TypeError("password can't be empty")
-    if not isinstance(username, basestring):
-        raise TypeError("username must be an instance "
-                        "of %s" % (basestring.__name__,))
-
-    md5hash = _md5func()
-    data = "%s:mongo:%s" % (username, password)
-    md5hash.update(data.encode('utf-8'))
-    return unicode(md5hash.hexdigest())
-
-
-def _auth_key(nonce, username, password):
-    """Get an auth key to use for authentication.
-    """
-    digest = _password_digest(username, password)
-    md5hash = _md5func()
-    data = "%s%s%s" % (nonce, unicode(username), digest)
-    md5hash.update(data.encode('utf-8'))
-    return unicode(md5hash.hexdigest())
+    errors = [res for res in results
+              if "writeErrors" in res[1] or "writeConcernError" in res[1]]
+    if errors:
+        # If multiple batches had errors
+        # raise from the last batch.
+        offset, result = errors[-1]
+        # Prefer write errors over write concern errors
+        write_errors = result.get("writeErrors")
+        if write_errors:
+            # If the last batch had multiple errors only report
+            # the last error to emulate continue_on_error.
+            error = write_errors[-1]
+            error["index"] += offset
+            if error.get("code") == 11000:
+                raise DuplicateKeyError(error.get("errmsg"), 11000, error)
+        else:
+            error = result["writeConcernError"]
+            if "errInfo" in error and error["errInfo"].get('wtimeout'):
+                # Make sure we raise WTimeoutError
+                raise WTimeoutError(error.get("errmsg"),
+                                    error.get("code"), error)
+        raise OperationFailure(error.get("errmsg"), error.get("code"), error)
 
 
 def _fields_list_to_dict(fields):
@@ -192,6 +222,7 @@ def _fields_list_to_dict(fields):
         as_dict[field] = 1
     return as_dict
 
+
 def shuffled(sequence):
     """Returns a copy of the sequence (as a :class:`list`) which has been
     shuffled by :func:`random.shuffle`.
@@ -199,4 +230,3 @@ def shuffled(sequence):
     out = list(sequence)
     random.shuffle(out)
     return out
-

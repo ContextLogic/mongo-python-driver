@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,21 +19,23 @@ import unittest
 import sys
 sys.path[0:0] = [""]
 
-from bson.objectid import ObjectId
 from bson.son import SON
 from pymongo.database import Database
 from pymongo.son_manipulator import (NamespaceInjector,
                                      ObjectIdInjector,
                                      ObjectIdShuffler,
                                      SONManipulator)
-from test.test_connection import get_connection
+from test.test_client import get_client
 from test import qcheck
 
 
 class TestSONManipulator(unittest.TestCase):
 
     def setUp(self):
-        self.db = Database(get_connection(), "pymongo_test")
+        self.db = Database(get_client(), "pymongo_test")
+
+    def tearDown(self):
+        self.db = None
 
     def test_basic(self):
         manip = SONManipulator()

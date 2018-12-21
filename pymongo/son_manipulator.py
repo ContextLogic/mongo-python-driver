@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -64,6 +64,10 @@ class SONManipulator(object):
 
 class ObjectIdInjector(SONManipulator):
     """A son manipulator that adds the _id field if it is missing.
+
+    .. versionchanged:: 2.7
+       ObjectIdInjector is no longer used by PyMongo, but remains in this
+       module for backwards compatibility.
     """
 
     def transform_incoming(self, son, collection):
@@ -122,7 +126,7 @@ class AutoReference(SONManipulator):
     """
 
     def __init__(self, db):
-        self.__database = db
+        self.database = db
 
     def will_copy(self):
         """We need to copy so the user's document doesn't get transformed refs.
@@ -156,7 +160,7 @@ class AutoReference(SONManipulator):
 
         def transform_value(value):
             if isinstance(value, DBRef):
-                return self.__database.dereference(value)
+                return self.database.dereference(value)
             elif isinstance(value, list):
                 return [transform_value(v) for v in value]
             elif isinstance(value, dict):

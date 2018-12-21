@@ -1,4 +1,4 @@
-# Copyright 2009-2012 10gen, Inc.
+# Copyright 2009-2014 MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,6 @@
 
 """Tests for the dbref module."""
 
-import os
 import pickle
 import unittest
 import sys
@@ -28,10 +27,6 @@ from copy import deepcopy
 
 
 class TestDBRef(unittest.TestCase):
-
-    def setUp(self):
-        pass
-
     def test_creation(self):
         a = ObjectId()
         self.assertRaises(TypeError, DBRef)
@@ -76,12 +71,6 @@ class TestDBRef(unittest.TestCase):
                               ObjectId("1234567890abcdef12345678"), "foo")),
                          "DBRef('coll', ObjectId('1234567890abcdef12345678'), "
                          "'foo')")
-        # This assert will fail in Python 3.3+ unless
-        # hash randomization is disabled.
-        if (sys.version_info < (3, 3) or
-            os.environ.get('PYTHONHASHSEED') == '0'):
-            self.assertEqual(repr(DBRef("coll", 5, "baz", foo="bar", baz=4)),
-                             "DBRef('coll', 5, 'baz', foo='bar', baz=4)")
 
     def test_equality(self):
         obj_id = ObjectId("1234567890abcdef12345678")
